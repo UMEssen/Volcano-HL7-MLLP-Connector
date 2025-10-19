@@ -1,0 +1,77 @@
+services:
+  # Kafka broker
+  broker:
+    image: apache/kafka:3.7.0
+    hostname: broker
+    container_name: volcano-kafka
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://broker:29092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    networks:
+      - volcano-net
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # Volcano HL7 MLLP Connector
+  volcano-connector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: volcano-hl7-mllp
+    ports:
+      - "2575:2575"
+    environment:
+      MLLP_PORT: 2575
+      MLLP_TLS: "false"
+      KAFKA_BOOTSTRAP_SERVERS: broker:29092
+      KAFKA_TOPIC_PREFIX: volcano.
+      FANOUT_TYPE_EVENT: "false"
+      KAFKA_CLIENT_ID: volcano-hl7-mllp
+      KAFKA_ACK_TIMEOUT_MS: 5000
+      JAVA_OPTS: "-Xmx512m -Xms256m"
+    networks:
+      - volcano-net
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Kafka UI (optional, for monitoring topics)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: volcano-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:29092
+      KAFKA_CLUSTERS_0_METRICS_PORT: 9101
+    networks:
+      - volcano-net
+    depends_on:
+      - broker
+
+networks:
+  volcano-net:
+    driver: bridge

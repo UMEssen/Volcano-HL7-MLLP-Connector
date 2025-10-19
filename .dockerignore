@@ -1,0 +1,24 @@
+# Build artifacts
+target/
+project/target/
+project/project/
+
+# IDE files
+.metals/
+.vscode/
+.bloop/
+.bsp/
+
+# Environment files (use docker-compose env instead)
+.env
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+test-json-output.scala
