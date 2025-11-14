@@ -46,12 +46,16 @@ sbt run              # Local development
 docker-compose up    # Containerized with Kafka
 ```
 
-Key environment variables (see `.env` or `docker-compose.yml`):
+Key environment variables (see `.env.example` or `docker-compose.yml`):
 - `MLLP_PORT` - Port to listen on (default: 2575)
 - `MLLP_TLS` - Enable TLS (default: false)
 - `KAFKA_BOOTSTRAP_SERVERS` - Kafka broker addresses
 - `KAFKA_TOPIC_PREFIX` - Prefix for generated topics (default: "volcano.")
 - `FANOUT_TYPE_EVENT` - Also publish to type.event topics (default: false)
+- `KAFKA_SASL_ENABLED` - Enable SASL authentication (default: false)
+- `KAFKA_SASL_MECHANISM` - SASL mechanism (default: SCRAM-SHA-512)
+- `KAFKA_SASL_USERNAME` - SASL username (required if SASL enabled)
+- `KAFKA_SASL_PASSWORD` - SASL password (required if SASL enabled)
 
 ## Architecture
 
@@ -83,6 +87,22 @@ Uses MSH-10 (message control ID) as Kafka partition key for ordering. Falls back
 - **Metadata-Only Logging**: Never logs HL7 message payloads (PHI protection)
 - Logging configuration in `src/main/resources/logback.xml` enforces this
 - Only logs structure type, message control ID, and Kafka metadata (topic, partition, offset)
+
+### Security & Authentication
+
+**SASL SCRAM-SHA-512 Authentication:**
+The connector supports SASL authentication for secured Kafka clusters using SCRAM-SHA-512 mechanism.
+
+Configuration in Main.scala:76-87:
+- When `KAFKA_SASL_ENABLED=true`, the producer configures SASL authentication
+- Uses `SASL_PLAINTEXT` security protocol (SASL over plaintext connection)
+- Supports SCRAM-SHA-512 mechanism (configurable via `KAFKA_SASL_MECHANISM`)
+- Credentials provided via `KAFKA_SASL_USERNAME` and `KAFKA_SASL_PASSWORD` environment variables
+- JAAS configuration is generated programmatically using `ScramLoginModule`
+- Logs warning if SASL is enabled but credentials are missing
+
+**For production use with TLS:**
+To use SASL with encrypted connections, modify the security protocol from `SASL_PLAINTEXT` to `SASL_SSL` and configure SSL properties as needed.
 
 ## Code Patterns
 

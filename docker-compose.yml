@@ -49,6 +49,11 @@ services:
       FANOUT_TYPE_EVENT: "false"
       KAFKA_CLIENT_ID: volcano-hl7-mllp
       KAFKA_ACK_TIMEOUT_MS: 5000
+      # SASL Authentication (uncomment and configure for secured Kafka)
+      KAFKA_SASL_ENABLED: "false"
+      KAFKA_SASL_MECHANISM: SCRAM-SHA-512
+      # KAFKA_SASL_USERNAME: your-username
+      # KAFKA_SASL_PASSWORD: your-password
       JAVA_OPTS: "-Xmx512m -Xms256m"
     networks:
       - volcano-net

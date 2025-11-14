@@ -32,7 +32,11 @@ object Main:
     topicPrefix: String,
     fanOutTypeEvent: Boolean,
     kafkaClientId: String,
-    kafkaAcksTimeoutMs: Int
+    kafkaAcksTimeoutMs: Int,
+    kafkaSaslEnabled: Boolean,
+    kafkaSaslMechanism: String,
+    kafkaSaslUsername: Option[String],
+    kafkaSaslPassword: Option[String]
   )
   object Config:
     def env(name: String, default: => String): String =
@@ -45,7 +49,11 @@ object Main:
         topicPrefix        = sanitizePrefix(env("KAFKA_TOPIC_PREFIX", "volcano.")),
         fanOutTypeEvent    = env("FANOUT_TYPE_EVENT", "false").toBoolean, // also publish hl7.v2.<type>.<event>
         kafkaClientId      = env("KAFKA_CLIENT_ID", "volcano-hl7-mllp"),
-        kafkaAcksTimeoutMs = env("KAFKA_ACK_TIMEOUT_MS", "5000").toInt
+        kafkaAcksTimeoutMs = env("KAFKA_ACK_TIMEOUT_MS", "5000").toInt,
+        kafkaSaslEnabled   = env("KAFKA_SASL_ENABLED", "false").toBoolean,
+        kafkaSaslMechanism = env("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512"),
+        kafkaSaslUsername  = sys.env.get("KAFKA_SASL_USERNAME"),
+        kafkaSaslPassword  = sys.env.get("KAFKA_SASL_PASSWORD")
       )
     private def sanitizePrefix(p: String) =
       val px = if p.endsWith(".") || p.endsWith("_") || p.endsWith("-") then p else p + "."
@@ -64,6 +72,19 @@ object Main:
     props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "5")
     props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, Integer.valueOf(5000))
     props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.valueOf(Math.max(cfg.kafkaAcksTimeoutMs, 10000)))
+
+    // SASL authentication
+    if cfg.kafkaSaslEnabled then
+      (cfg.kafkaSaslUsername, cfg.kafkaSaslPassword) match
+        case (Some(username), Some(password)) =>
+          props.put("security.protocol", "SASL_PLAINTEXT")
+          props.put("sasl.mechanism", cfg.kafkaSaslMechanism)
+          val jaasConfig = s"""org.apache.kafka.common.security.scram.ScramLoginModule required username="$username" password="$password";"""
+          props.put("sasl.jaas.config", jaasConfig)
+          log.info(s"SASL authentication enabled with mechanism ${cfg.kafkaSaslMechanism}")
+        case _ =>
+          log.warn("SASL enabled but username or password missing - connecting without authentication")
+
     new KafkaProducer[String,String](props)
 
   private def topicNames(prefix: String, terser: Terser, fanOut: Boolean): Seq[String] =
