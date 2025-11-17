@@ -31,8 +31,9 @@ RUN sbt assembly
 # Stage 2: Runtime image
 FROM eclipse-temurin:21-jre-jammy
 
-# Create non-root user
-RUN groupadd -r volcano && useradd -r -g volcano volcano
+# Create non-root user and directories
+RUN groupadd -r volcano && useradd -r -g volcano volcano && \
+    mkdir -p /app/certs
 
 WORKDIR /app
 
@@ -47,13 +48,19 @@ ENV MLLP_PORT=2575 \
     FANOUT_TYPE_EVENT=false \
     KAFKA_CLIENT_ID=volcano-hl7-mllp \
     KAFKA_ACK_TIMEOUT_MS=5000 \
+    KAFKA_SASL_ENABLED=false \
+    KAFKA_SASL_MECHANISM=SCRAM-SHA-512 \
+    KAFKA_SSL_ENABLED=false \
+    KAFKA_SSL_TRUSTSTORE_LOCATION=/app/certs/ca-cert.pem \
+    KAFKA_SSL_TRUSTSTORE_TYPE=PEM \
     JAVA_OPTS="-Xmx512m -Xms256m"
 
 # Expose MLLP port
 EXPOSE 2575
 
 # Switch to non-root user
-RUN chown -R volcano:volcano /app
+RUN chown -R volcano:volcano /app && \
+    chmod 755 /app/certs
 USER volcano
 
 # Health check (check if port is listening)

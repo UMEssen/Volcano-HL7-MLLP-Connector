@@ -36,7 +36,10 @@ object Main:
     kafkaSaslEnabled: Boolean,
     kafkaSaslMechanism: String,
     kafkaSaslUsername: Option[String],
-    kafkaSaslPassword: Option[String]
+    kafkaSaslPassword: Option[String],
+    kafkaSslEnabled: Boolean,
+    kafkaSslTruststoreLocation: Option[String],
+    kafkaSslTruststoreType: String
   )
   object Config:
     def env(name: String, default: => String): String =
@@ -53,7 +56,10 @@ object Main:
         kafkaSaslEnabled   = env("KAFKA_SASL_ENABLED", "false").toBoolean,
         kafkaSaslMechanism = env("KAFKA_SASL_MECHANISM", "SCRAM-SHA-512"),
         kafkaSaslUsername  = sys.env.get("KAFKA_SASL_USERNAME"),
-        kafkaSaslPassword  = sys.env.get("KAFKA_SASL_PASSWORD")
+        kafkaSaslPassword  = sys.env.get("KAFKA_SASL_PASSWORD"),
+        kafkaSslEnabled    = env("KAFKA_SSL_ENABLED", "false").toBoolean,
+        kafkaSslTruststoreLocation = sys.env.get("KAFKA_SSL_TRUSTSTORE_LOCATION"),
+        kafkaSslTruststoreType = env("KAFKA_SSL_TRUSTSTORE_TYPE", "PEM")
       )
     private def sanitizePrefix(p: String) =
       val px = if p.endsWith(".") || p.endsWith("_") || p.endsWith("-") then p else p + "."
@@ -73,17 +79,36 @@ object Main:
     props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, Integer.valueOf(5000))
     props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.valueOf(Math.max(cfg.kafkaAcksTimeoutMs, 10000)))
 
+    // Security protocol configuration (SSL and/or SASL)
+    val securityProtocol = (cfg.kafkaSslEnabled, cfg.kafkaSaslEnabled) match
+      case (true, true)  => "SASL_SSL"      // Both TLS and SASL
+      case (true, false) => "SSL"           // TLS only
+      case (false, true) => "SASL_PLAINTEXT" // SASL without TLS
+      case (false, false) => "PLAINTEXT"    // No security (default)
+
+    props.put("security.protocol", securityProtocol)
+    log.info(s"Kafka security protocol: $securityProtocol")
+
     // SASL authentication
     if cfg.kafkaSaslEnabled then
       (cfg.kafkaSaslUsername, cfg.kafkaSaslPassword) match
         case (Some(username), Some(password)) =>
-          props.put("security.protocol", "SASL_PLAINTEXT")
           props.put("sasl.mechanism", cfg.kafkaSaslMechanism)
           val jaasConfig = s"""org.apache.kafka.common.security.scram.ScramLoginModule required username="$username" password="$password";"""
           props.put("sasl.jaas.config", jaasConfig)
           log.info(s"SASL authentication enabled with mechanism ${cfg.kafkaSaslMechanism}")
         case _ =>
           log.warn("SASL enabled but username or password missing - connecting without authentication")
+
+    // SSL/TLS configuration
+    if cfg.kafkaSslEnabled then
+      cfg.kafkaSslTruststoreLocation match
+        case Some(truststorePath) =>
+          props.put("ssl.truststore.location", truststorePath)
+          props.put("ssl.truststore.type", cfg.kafkaSslTruststoreType)
+          log.info(s"SSL enabled with truststore: $truststorePath (type: ${cfg.kafkaSslTruststoreType})")
+        case None =>
+          log.warn("SSL enabled but truststore location not specified - using default JVM truststore")
 
     new KafkaProducer[String,String](props)
 
@@ -188,55 +213,86 @@ object Main:
     gson.toJson(json)
 
   def main(args: Array[String]): Unit =
-    val cfg = Config.load()
-    log.info(s"Starting Volcano HL7 MLLP connector on port ${cfg.port}, TLS=${cfg.useTls}, Kafka=${cfg.kafkaBootstrap}, prefix='${cfg.topicPrefix}', fanOut=${cfg.fanOutTypeEvent}")
+    try
+      val cfg = Config.load()
+      log.info(s"Starting Volcano HL7 MLLP connector on port ${cfg.port}, TLS=${cfg.useTls}, Kafka=${cfg.kafkaBootstrap}, prefix='${cfg.topicPrefix}', fanOut=${cfg.fanOutTypeEvent}")
 
-    val hapiCtx   = new DefaultHapiContext()
-    val server: HL7Service = hapiCtx.newServer(cfg.port, cfg.useTls)
-    val pipeParser = hapiCtx.getPipeParser()
-    val producer = kafkaProducer(cfg)
+      val hapiCtx   = new DefaultHapiContext()
+      val pipeParser = hapiCtx.getPipeParser()
 
-    // Application handler
-    val app = new ReceivingApplication[Message]:
-      override def canProcess(in: Message): Boolean = true
-      override def processMessage(in: Message, meta: java.util.Map[String,Object]): Message =
-        // Parse quickly and avoid logging PHI
-        val terser = new Terser(in)
-        val key    = messageKey(terser)
-        val topics = topicNames(cfg.topicPrefix, terser, cfg.fanOutTypeEvent)
-        val info   =
-          val t  = Option(terser.get("/MSH-9-1")).getOrElse("?")
-          val ev = Option(terser.get("/MSH-9-2")).getOrElse("?")
-          val st = Option(terser.get("/MSH-9-3")).getOrElse("?")
-          s"$st ($t^$ev)"
-        try
-          val json = messageToJson(in, pipeParser) // HAPI HL7v2 → JSON (string)
-          topics.foreach { topic =>
-            val rec = new ProducerRecord[String,String](topic, key, json)
-            // sync send so we can decide ACK vs AE deterministically
-            val md: RecordMetadata = producer.send(rec).get(5, java.util.concurrent.TimeUnit.SECONDS)
-            // Only log metadata, never payload
-            log.debug(s"Produced to ${md.topic}@${md.partition} offset=${md.offset} key=$key struct=$info")
-          }
-          ackOk(in)
-        catch
-          case e: java.util.concurrent.TimeoutException =>
-            log.warn(s"Kafka timeout; key=$key struct=$info: ${e.getMessage}")
-            ackErr(in, s"Kafka timeout")
-          case e: Exception =>
-            log.error(s"Kafka failure; key=$key struct=$info", e)
-            ackErr(in, s"Kafka error: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}")
+      log.info("Initializing Kafka producer...")
+      val producer = try {
+        kafkaProducer(cfg)
+      } catch {
+        case e: Exception =>
+          log.error("Failed to initialize Kafka producer. Check Kafka connection and SSL/SASL settings.", e)
+          throw e
+      }
+      log.info("Kafka producer initialized successfully")
 
-    // register wildcard (any MSH-9)
-    server.registerApplication("*", "*", app)
-    Runtime.getRuntime.addShutdownHook(new Thread(() =>
-      log.info("Shutting down...")
-      Try(server.stopAndWait())
-      Try(producer.flush())
-      Try(producer.close(java.time.Duration.ofSeconds(5)))
-      Try(hapiCtx.close())
-      log.info("Stopped.")
-    ))
+      log.info(s"Creating MLLP server on port ${cfg.port}...")
+      val server: HL7Service = hapiCtx.newServer(cfg.port, cfg.useTls)
 
-    server.startAndWait()
-    log.info(s"MLLP listener up on :${cfg.port}")
+      // Application handler
+      val app = new ReceivingApplication[Message]:
+        override def canProcess(in: Message): Boolean = true
+        override def processMessage(in: Message, meta: java.util.Map[String,Object]): Message =
+          // Parse quickly and avoid logging PHI
+          val terser = new Terser(in)
+          val key    = messageKey(terser)
+          val topics = topicNames(cfg.topicPrefix, terser, cfg.fanOutTypeEvent)
+          val info   =
+            val t  = Option(terser.get("/MSH-9-1")).getOrElse("?")
+            val ev = Option(terser.get("/MSH-9-2")).getOrElse("?")
+            val st = Option(terser.get("/MSH-9-3")).getOrElse("?")
+            s"$st ($t^$ev)"
+
+          log.info(s"Received HL7 message: key=$key struct=$info")
+
+          try
+            val json = messageToJson(in, pipeParser) // HAPI HL7v2 → JSON (string)
+            topics.foreach { topic =>
+              val rec = new ProducerRecord[String,String](topic, key, json)
+              // sync send so we can decide ACK vs AE deterministically
+              log.info(s"Sending to Kafka topic=$topic key=$key")
+              val md: RecordMetadata = producer.send(rec).get(cfg.kafkaAcksTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+              // Only log metadata, never payload
+              log.info(s"Produced to ${md.topic}@${md.partition} offset=${md.offset} key=$key struct=$info")
+            }
+            log.info(s"Successfully processed message key=$key, sending ACK")
+            ackOk(in)
+          catch
+            case e: java.util.concurrent.TimeoutException =>
+              log.error(s"Kafka timeout (>${cfg.kafkaAcksTimeoutMs}ms); key=$key struct=$info", e)
+              ackErr(in, s"Kafka timeout")
+            case e: Exception =>
+              log.error(s"Kafka failure; key=$key struct=$info", e)
+              ackErr(in, s"Kafka error: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}")
+
+      // register wildcard (any MSH-9)
+      server.registerApplication("*", "*", app)
+      log.info("Registered HL7 message handler for all message types (*/*)")
+
+      Runtime.getRuntime.addShutdownHook(new Thread(() =>
+        log.info("Shutting down...")
+        Try(server.stopAndWait())
+        Try(producer.flush())
+        Try(producer.close(java.time.Duration.ofSeconds(5)))
+        Try(hapiCtx.close())
+        log.info("Stopped.")
+      ))
+
+      log.info(s"Starting MLLP listener on port ${cfg.port}...")
+      server.start()
+      log.info(s"✓ MLLP listener is ready and accepting connections on port ${cfg.port}")
+
+      // Keep main thread alive
+      try
+        Thread.currentThread().join()
+      catch
+        case _: InterruptedException =>
+          log.info("Main thread interrupted, shutting down...")
+    catch
+      case e: Exception =>
+        log.error("Fatal error during startup", e)
+        System.exit(1)

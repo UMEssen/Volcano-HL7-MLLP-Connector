@@ -54,7 +54,15 @@ services:
       KAFKA_SASL_MECHANISM: SCRAM-SHA-512
       # KAFKA_SASL_USERNAME: your-username
       # KAFKA_SASL_PASSWORD: your-password
+      # SSL/TLS Configuration (uncomment and configure for TLS-enabled Kafka)
+      KAFKA_SSL_ENABLED: "false"
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /app/certs/ca-cert.pem
+      KAFKA_SSL_TRUSTSTORE_TYPE: PEM  # Use PEM for .pem files, JKS or PKCS12 for Java keystores
       JAVA_OPTS: "-Xmx512m -Xms256m"
+    # Mount your Kafka cluster CA certificate here:
+    # Uncomment and modify the path to your local certificate file
+    # volumes:
+    #   - ./certs/ca-cert.pem:/app/certs/ca-cert.pem:ro
     networks:
       - volcano-net
     depends_on:
