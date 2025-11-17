@@ -9,7 +9,7 @@ A high-performance HL7 v2 MLLP listener that converts healthcare messages to JSO
 - **Kafka Integration** - Publishes messages to Kafka topics based on message structure
 - **Reliable Delivery** - Synchronous sends with deterministic ACK/NAK responses
 - **Privacy-First** - Metadata-only logging (no PHI in logs)
-- **Topic Routing** - Automatic routing based on MSH-9.3 message structure field
+- **Topic Routing** - Automatic routing based on MSH-9.1 (type) and MSH-9.2 (event) fields
 
 ## Quick Start with Docker Compose
 
@@ -73,19 +73,38 @@ Configure via environment variables:
 |----------|---------|-------------|
 | `MLLP_PORT` | `2575` | Port to listen on for MLLP connections |
 | `MLLP_TLS` | `false` | Enable TLS for MLLP (set to `true` for encrypted) |
+| `HL7_ENCODING` | `UTF-8` | Character encoding (UTF-8, ISO-8859-1, windows-1252, US-ASCII) |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker addresses |
 | `KAFKA_TOPIC_PREFIX` | `volcano.` | Prefix for generated topic names |
-| `FANOUT_TYPE_EVENT` | `false` | Also publish to `{prefix}hl7.v2.{type}.{event}` topics |
+| `KAFKA_TOPIC_NAME` | `legacy` | Topic naming strategy: `legacy` or `message_structure` |
 | `KAFKA_CLIENT_ID` | `volcano-hl7-mllp` | Kafka client identifier |
 | `KAFKA_ACK_TIMEOUT_MS` | `5000` | Kafka acknowledgment timeout |
 | `JAVA_OPTS` | `-Xmx512m -Xms256m` | JVM options |
 
-## Topic Naming
+## Topic Naming & Routing Strategies
 
-Messages are routed to Kafka topics based on the HL7 message structure (MSH-9.3 field):
+The connector supports two routing strategies controlled by the `KAFKA_TOPIC_NAME` environment variable:
 
-- Primary topic: `{prefix}hl7.v2.{structure}` (e.g., `volcano.hl7.v2.adt_a01`)
-- Optional fanout: `{prefix}hl7.v2.{type}.{event}` (e.g., `volcano.hl7.v2.adt.a01`) when `FANOUT_TYPE_EVENT=true`
+### Legacy Mode (default: `KAFKA_TOPIC_NAME=legacy`)
+
+**Best for: HL7 v2.x (all versions including pre-v2.5)**
+
+Uses MSH-9.1 (message type) and MSH-9.2 (trigger event):
+- Topic format: `{prefix}hl7.v2.{type}.{event}`
+- Example: `volcano.hl7.v2.adt.a01`
+- Fallback: Uses "UNKNOWN" for missing fields (e.g., `volcano.hl7.v2.unknown.a01`)
+- Compatible with older HL7 messages that may not populate MSH-9.3
+
+### Message Structure Mode (`KAFKA_TOPIC_NAME=message_structure`)
+
+**Best for: HL7 v2.5 and later**
+
+Uses MSH-9.3 (message structure):
+- Topic format: `{prefix}hl7.v2.{structure}`
+- Example: `volcano.hl7.v2.adt_a01`
+- Fallback: Uses "UNKNOWN" if MSH-9.3 is missing (e.g., `volcano.hl7.v2.unknown`)
+- More precise routing as MSH-9.3 explicitly defines the message structure
+- Note: MSH-9.3 is required in HL7 v2.5+ but optional in earlier versions
 
 ## JSON Output Format
 
@@ -131,7 +150,7 @@ Check the Kafka topic:
 # Using kafka-console-consumer
 docker exec -it volcano-kafka kafka-console-consumer.sh \
   --bootstrap-server broker:29092 \
-  --topic volcano.hl7.v2.adt_a01 \
+  --topic volcano.hl7.v2.adt.a01 \
   --from-beginning
 ```
 
@@ -142,7 +161,9 @@ Or view in Kafka UI at http://localhost:8080
 1. **MLLP Listener** - Receives HL7 v2 messages on configured port
 2. **Message Parsing** - HAPI library parses HL7 structure
 3. **JSON Conversion** - Custom converter creates structured JSON
-4. **Topic Routing** - Routes to topics based on message structure (MSH-9.3)
+4. **Topic Routing** - Routes to topics based on configurable strategy:
+   - Legacy: MSH-9.1 (type) + MSH-9.2 (event) for HL7 v2.x compatibility
+   - Message Structure: MSH-9.3 (structure) for HL7 v2.5+ precision
 5. **Kafka Publishing** - Synchronous send with timeout
 6. **ACK Response** - Returns HL7 AA (success) or AE (error) to sender
 

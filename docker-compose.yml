@@ -47,7 +47,7 @@ services:
       HL7_ENCODING: UTF-8
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
       KAFKA_TOPIC_PREFIX: volcano.
-      FANOUT_TYPE_EVENT: "false"
+      KAFKA_TOPIC_NAME: legacy  # Options: legacy (MSH-9.1.MSH-9.2, HL7 v2.x) | message_structure (MSH-9.3, HL7 v2.5+)
       KAFKA_CLIENT_ID: volcano-hl7-mllp
       KAFKA_ACK_TIMEOUT_MS: 5000
       # SASL Authentication (uncomment and configure for secured Kafka)

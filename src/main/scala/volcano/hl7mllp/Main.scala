@@ -30,7 +30,7 @@ object Main:
     useTls: Boolean,
     kafkaBootstrap: String,
     topicPrefix: String,
-    fanOutTypeEvent: Boolean,
+    kafkaTopicName: String,
     kafkaClientId: String,
     kafkaAcksTimeoutMs: Int,
     kafkaSaslEnabled: Boolean,
@@ -51,7 +51,7 @@ object Main:
         useTls             = env("MLLP_TLS", "false").toBoolean, // plain by default
         kafkaBootstrap     = env("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
         topicPrefix        = sanitizePrefix(env("KAFKA_TOPIC_PREFIX", "volcano.")),
-        fanOutTypeEvent    = env("FANOUT_TYPE_EVENT", "false").toBoolean, // also publish hl7.v2.<type>.<event>
+        kafkaTopicName     = env("KAFKA_TOPIC_NAME", "legacy").toLowerCase,
         kafkaClientId      = env("KAFKA_CLIENT_ID", "volcano-hl7-mllp"),
         kafkaAcksTimeoutMs = env("KAFKA_ACK_TIMEOUT_MS", "5000").toInt,
         kafkaSaslEnabled   = env("KAFKA_SASL_ENABLED", "false").toBoolean,
@@ -114,25 +114,37 @@ object Main:
 
     new KafkaProducer[String,String](props)
 
-  private def topicNames(prefix: String, terser: Terser, fanOut: Boolean): Seq[String] =
-    // MSH-9.3 is HL7 v2 "message structure" (e.g., ADT_A01, ORU_R01) – most stable for routing
-    val structure = Option(terser.get("/MSH-9-3")).map(_.trim).filter(_.nonEmpty)
-    val typ       = Option(terser.get("/MSH-9-1")).map(_.trim).filter(_.nonEmpty) // ADT/ORU/ORM...
-    val event     = Option(terser.get("/MSH-9-2")).map(_.trim).filter(_.nonEmpty) // A01/R01...
-    val base = structure.orElse(typ.map(t => s"${t}_UNKNOWN")).getOrElse("UNKNOWN")
-    val primary = s"${prefix}hl7.v2.${base.replace('^','_').replace('/','_').replace(' ','_')}".toLowerCase
-    val extra =
-      if fanOut && typ.nonEmpty && event.nonEmpty then
-        Seq(s"${prefix}hl7.v2.${typ.get}.${event.get}".toLowerCase)
-      else Seq.empty
-    primary +: extra
+  private def topicNames(prefix: String, terser: Terser, topicNameStrategy: String): Seq[String] =
+    val topic = topicNameStrategy match
+      case "message_structure" =>
+        // MSH-9.3 is message structure (ADT_A01, ORU_R01, etc.) - required in HL7 v2.5+
+        val structure = Option(terser.get("/MSH-9-3")).map(_.trim).filter(_.nonEmpty).getOrElse("UNKNOWN")
+        val sanitized = structure.replace('^','_').replace('/','_').replace(' ','_')
+        s"${prefix}hl7.v2.${sanitized}".toLowerCase
 
-  private def messageKey(terser: Terser): String =
-    // Prefer MSH-10 message control ID; fallback to structure+timestamp
+      case _ => // "legacy" or default
+        // MSH-9.1 is message type (ADT/ORU/ORM...), MSH-9.2 is trigger event (A01/R01...)
+        // Using type.event format for backwards compatibility with HL7 v2 versions prior to v2.5
+        val typ   = Option(terser.get("/MSH-9-1")).map(_.trim).filter(_.nonEmpty).getOrElse("UNKNOWN")
+        val event = Option(terser.get("/MSH-9-2")).map(_.trim).filter(_.nonEmpty).getOrElse("UNKNOWN")
+        val sanitizedTyp   = typ.replace('^','_').replace('/','_').replace(' ','_')
+        val sanitizedEvent = event.replace('^','_').replace('/','_').replace(' ','_')
+        s"${prefix}hl7.v2.${sanitizedTyp}.${sanitizedEvent}".toLowerCase
+
+    Seq(topic)
+
+  private def messageKey(terser: Terser, topicNameStrategy: String): String =
+    // Prefer MSH-10 message control ID; fallback depends on topic naming strategy
     val mcid = Option(terser.get("/MSH-10")).filter(s => s != null && s.nonEmpty)
     mcid.getOrElse {
-      val s = Option(terser.get("/MSH-9-3")).getOrElse("UNKNOWN")
-      s"${s}-${System.currentTimeMillis()}"
+      topicNameStrategy match
+        case "message_structure" =>
+          val structure = Option(terser.get("/MSH-9-3")).map(_.trim).filter(_.nonEmpty).getOrElse("UNKNOWN")
+          s"${structure}-${System.currentTimeMillis()}"
+        case _ => // "legacy" or default
+          val typ = Option(terser.get("/MSH-9-1")).map(_.trim).filter(_.nonEmpty).getOrElse("UNKNOWN")
+          val event = Option(terser.get("/MSH-9-2")).map(_.trim).filter(_.nonEmpty).getOrElse("UNKNOWN")
+          s"${typ}.${event}-${System.currentTimeMillis()}"
     }
 
   private def ackOk(msg: Message): Message =
@@ -218,8 +230,9 @@ object Main:
     try
       val cfg = Config.load()
 
-      log.info(s"Starting Volcano HL7 MLLP connector on port ${cfg.port}, TLS=${cfg.useTls}, Kafka=${cfg.kafkaBootstrap}, prefix='${cfg.topicPrefix}', fanOut=${cfg.fanOutTypeEvent}")
+      log.info(s"Starting Volcano HL7 MLLP connector on port ${cfg.port}, TLS=${cfg.useTls}, Kafka=${cfg.kafkaBootstrap}, prefix='${cfg.topicPrefix}'")
       log.info(s"HL7 MLLP Charset configured: ${cfg.hl7Encoding}")
+      log.info(s"Kafka topic naming strategy: ${cfg.kafkaTopicName} (${if cfg.kafkaTopicName == "message_structure" then "HL7 v2.5+" else "HL7 v2.x legacy"})")
 
       // Configure HAPI context with proper character encoding
       val hapiCtx = new DefaultHapiContext()
@@ -249,8 +262,8 @@ object Main:
         override def processMessage(in: Message, meta: java.util.Map[String,Object]): Message =
           // Parse quickly and avoid logging PHI
           val terser = new Terser(in)
-          val key    = messageKey(terser)
-          val topics = topicNames(cfg.topicPrefix, terser, cfg.fanOutTypeEvent)
+          val key    = messageKey(terser, cfg.kafkaTopicName)
+          val topics = topicNames(cfg.topicPrefix, terser, cfg.kafkaTopicName)
           val info   =
             val t  = Option(terser.get("/MSH-9-1")).getOrElse("?")
             val ev = Option(terser.get("/MSH-9-2")).getOrElse("?")
