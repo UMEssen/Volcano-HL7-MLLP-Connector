@@ -43,6 +43,7 @@ COPY --from=builder /build/target/scala-3.3.3/*-assembly-*.jar /app/volcano-conn
 # Environment variables with defaults
 ENV MLLP_PORT=2575 \
     MLLP_TLS=false \
+    HL7_ENCODING=UTF-8 \
     KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
     KAFKA_TOPIC_PREFIX=volcano. \
     FANOUT_TYPE_EVENT=false \

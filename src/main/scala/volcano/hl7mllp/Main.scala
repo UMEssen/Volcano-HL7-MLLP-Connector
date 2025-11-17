@@ -9,7 +9,7 @@ import ca.uhn.hl7v2.model.{Message, Segment, Type, Primitive}
 import ca.uhn.hl7v2.parser.{Parser, PipeParser}
 import ca.uhn.hl7v2.util.Terser
 import ca.uhn.hl7v2.HL7Exception
-import ca.uhn.hl7v2.llp.LLPException
+import ca.uhn.hl7v2.llp.{LLPException, MinLowerLayerProtocol}
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
 import org.apache.kafka.common.serialization.{StringSerializer}
 import org.slf4j.LoggerFactory
@@ -39,7 +39,8 @@ object Main:
     kafkaSaslPassword: Option[String],
     kafkaSslEnabled: Boolean,
     kafkaSslTruststoreLocation: Option[String],
-    kafkaSslTruststoreType: String
+    kafkaSslTruststoreType: String,
+    hl7Encoding: String
   )
   object Config:
     def env(name: String, default: => String): String =
@@ -59,7 +60,8 @@ object Main:
         kafkaSaslPassword  = sys.env.get("KAFKA_SASL_PASSWORD"),
         kafkaSslEnabled    = env("KAFKA_SSL_ENABLED", "false").toBoolean,
         kafkaSslTruststoreLocation = sys.env.get("KAFKA_SSL_TRUSTSTORE_LOCATION"),
-        kafkaSslTruststoreType = env("KAFKA_SSL_TRUSTSTORE_TYPE", "PEM")
+        kafkaSslTruststoreType = env("KAFKA_SSL_TRUSTSTORE_TYPE", "PEM"),
+        hl7Encoding        = env("HL7_ENCODING", "UTF-8")
       )
     private def sanitizePrefix(p: String) =
       val px = if p.endsWith(".") || p.endsWith("_") || p.endsWith("-") then p else p + "."
@@ -215,9 +217,17 @@ object Main:
   def main(args: Array[String]): Unit =
     try
       val cfg = Config.load()
-      log.info(s"Starting Volcano HL7 MLLP connector on port ${cfg.port}, TLS=${cfg.useTls}, Kafka=${cfg.kafkaBootstrap}, prefix='${cfg.topicPrefix}', fanOut=${cfg.fanOutTypeEvent}")
 
-      val hapiCtx   = new DefaultHapiContext()
+      log.info(s"Starting Volcano HL7 MLLP connector on port ${cfg.port}, TLS=${cfg.useTls}, Kafka=${cfg.kafkaBootstrap}, prefix='${cfg.topicPrefix}', fanOut=${cfg.fanOutTypeEvent}")
+      log.info(s"HL7 MLLP Charset configured: ${cfg.hl7Encoding}")
+
+      // Configure HAPI context with proper character encoding
+      val hapiCtx = new DefaultHapiContext()
+      val llp = new MinLowerLayerProtocol()
+      llp.setCharset(cfg.hl7Encoding)
+      hapiCtx.setLowerLayerProtocol(llp)
+      log.info(s"MinLowerLayerProtocol charset explicitly set to: ${cfg.hl7Encoding}")
+
       val pipeParser = hapiCtx.getPipeParser()
 
       log.info("Initializing Kafka producer...")

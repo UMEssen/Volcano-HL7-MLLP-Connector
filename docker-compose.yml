@@ -44,6 +44,7 @@ services:
     environment:
       MLLP_PORT: 2575
       MLLP_TLS: "false"
+      HL7_ENCODING: UTF-8
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
       KAFKA_TOPIC_PREFIX: volcano.
       FANOUT_TYPE_EVENT: "false"
