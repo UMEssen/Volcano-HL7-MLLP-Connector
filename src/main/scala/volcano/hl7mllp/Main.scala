@@ -260,19 +260,19 @@ object Main:
       val app = new ReceivingApplication[Message]:
         override def canProcess(in: Message): Boolean = true
         override def processMessage(in: Message, meta: java.util.Map[String,Object]): Message =
-          // Parse quickly and avoid logging PHI
-          val terser = new Terser(in)
-          val key    = messageKey(terser, cfg.kafkaTopicName)
-          val topics = topicNames(cfg.topicPrefix, terser, cfg.kafkaTopicName)
-          val info   =
-            val t  = Option(terser.get("/MSH-9-1")).getOrElse("?")
-            val ev = Option(terser.get("/MSH-9-2")).getOrElse("?")
-            val st = Option(terser.get("/MSH-9-3")).getOrElse("?")
-            s"$st ($t^$ev)"
-
-          log.info(s"Received HL7 message: key=$key struct=$info")
-
           try
+            // Parse quickly and avoid logging PHI
+            val terser = new Terser(in)
+            val key    = messageKey(terser, cfg.kafkaTopicName)
+            val topics = topicNames(cfg.topicPrefix, terser, cfg.kafkaTopicName)
+            val info   =
+              val t  = Option(terser.get("/MSH-9-1")).getOrElse("?")
+              val ev = Option(terser.get("/MSH-9-2")).getOrElse("?")
+              val st = Option(terser.get("/MSH-9-3")).getOrElse("?")
+              s"$st ($t^$ev)"
+
+            log.info(s"Received HL7 message: key=$key struct=$info")
+
             val json = messageToJson(in, pipeParser) // HAPI HL7v2 → JSON (string)
             topics.foreach { topic =>
               val rec = new ProducerRecord[String,String](topic, key, json)
@@ -286,11 +286,17 @@ object Main:
             ackOk(in)
           catch
             case e: java.util.concurrent.TimeoutException =>
-              log.error(s"Kafka timeout (>${cfg.kafkaAcksTimeoutMs}ms); key=$key struct=$info", e)
-              ackErr(in, s"Kafka timeout")
+              val errorMsg = s"Kafka timeout (>${cfg.kafkaAcksTimeoutMs}ms)"
+              log.error(errorMsg, e)
+              ackErr(in, errorMsg)
+            case e: HL7Exception =>
+              val errorMsg = s"HL7 parsing error: ${Option(e.getMessage).getOrElse("Invalid message format")}"
+              log.error(errorMsg, e)
+              ackErr(in, errorMsg)
             case e: Exception =>
-              log.error(s"Kafka failure; key=$key struct=$info", e)
-              ackErr(in, s"Kafka error: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}")
+              val errorMsg = s"Processing error: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"
+              log.error(errorMsg, e)
+              ackErr(in, errorMsg)
 
       // register wildcard (any MSH-9)
       server.registerApplication("*", "*", app)
