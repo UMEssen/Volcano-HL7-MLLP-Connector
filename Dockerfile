@@ -1,7 +1,7 @@
 # Multi-stage build for Volcano HL7 MLLP Connector
 
 # Stage 1: Build the application using pre-built JAR
-FROM eclipse-temurin:21-jdk-jammy AS builder
+FROM eclipse-temurin:25-jdk-noble AS builder
 
 # Install SBT
 RUN apt-get update && \
@@ -29,7 +29,7 @@ COPY src ./src
 RUN sbt assembly
 
 # Stage 2: Runtime image
-FROM eclipse-temurin:21-jre-jammy
+FROM eclipse-temurin:25-jre-noble
 
 # Create non-root user and directories
 RUN groupadd -r volcano && useradd -r -g volcano volcano && \
@@ -38,7 +38,7 @@ RUN groupadd -r volcano && useradd -r -g volcano volcano && \
 WORKDIR /app
 
 # Copy the fat JAR with all dependencies
-COPY --from=builder /build/target/scala-3.3.3/*-assembly-*.jar /app/volcano-connector.jar
+COPY --from=builder /build/target/scala-*/*-assembly-*.jar /app/volcano-connector.jar
 
 # Environment variables with defaults
 ENV MLLP_PORT=2575 \
