@@ -1,6 +1,6 @@
 // Purpose: SBT config for Volcano HL7 MLLP → Kafka connector.
 
-ThisBuild / scalaVersion := "3.3.3"
+ThisBuild / scalaVersion := "3.3.7"
 ThisBuild / version := "0.1.0"
 ThisBuild / organization := "de.ume.volcano"
 
@@ -12,7 +12,7 @@ lazy val root = (project in file("."))
       "ca.uhn.hapi" % "hapi-structures-v25" % "2.6.0",
       "org.apache.kafka" % "kafka-clients" % "4.1.1",
       "org.slf4j" % "slf4j-api" % "2.0.17",
-      "ch.qos.logback" % "logback-classic" % "1.5.21",
+      "ch.qos.logback" % "logback-classic" % "1.5.22",
       "com.google.code.gson" % "gson" % "2.13.2"
     ),
     assembly / assemblyMergeStrategy := {
