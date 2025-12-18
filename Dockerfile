@@ -1,7 +1,7 @@
 # Multi-stage build for Volcano HL7 MLLP Connector
 
 # Stage 1: Build the application using pre-built JAR
-FROM eclipse-temurin:21-jdk-jammy AS builder
+FROM eclipse-temurin:25-jdk-noble AS builder
 
 # Install SBT
 RUN apt-get update && \
@@ -29,31 +29,39 @@ COPY src ./src
 RUN sbt assembly
 
 # Stage 2: Runtime image
-FROM eclipse-temurin:21-jre-jammy
+FROM eclipse-temurin:25-jre-noble
 
-# Create non-root user
-RUN groupadd -r volcano && useradd -r -g volcano volcano
+# Create non-root user and directories
+RUN groupadd -r volcano && useradd -r -g volcano volcano && \
+    mkdir -p /app/certs
 
 WORKDIR /app
 
 # Copy the fat JAR with all dependencies
-COPY --from=builder /build/target/scala-3.3.3/*-assembly-*.jar /app/volcano-connector.jar
+COPY --from=builder /build/target/scala-*/*-assembly-*.jar /app/volcano-connector.jar
 
 # Environment variables with defaults
 ENV MLLP_PORT=2575 \
     MLLP_TLS=false \
+    HL7_ENCODING=UTF-8 \
     KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
     KAFKA_TOPIC_PREFIX=volcano. \
-    FANOUT_TYPE_EVENT=false \
+    KAFKA_TOPIC_NAME=legacy \
     KAFKA_CLIENT_ID=volcano-hl7-mllp \
     KAFKA_ACK_TIMEOUT_MS=5000 \
+    KAFKA_SASL_ENABLED=false \
+    KAFKA_SASL_MECHANISM=SCRAM-SHA-512 \
+    KAFKA_SSL_ENABLED=false \
+    KAFKA_SSL_TRUSTSTORE_LOCATION=/app/certs/ca-cert.pem \
+    KAFKA_SSL_TRUSTSTORE_TYPE=PEM \
     JAVA_OPTS="-Xmx512m -Xms256m"
 
 # Expose MLLP port
 EXPOSE 2575
 
 # Switch to non-root user
-RUN chown -R volcano:volcano /app
+RUN chown -R volcano:volcano /app && \
+    chmod 755 /app/certs
 USER volcano
 
 # Health check (check if port is listening)

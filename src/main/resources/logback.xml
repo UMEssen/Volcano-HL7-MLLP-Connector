@@ -5,6 +5,8 @@
   </appender>
   <root level="INFO"><appender-ref ref="STDOUT"/></root>
   <logger name="volcano.hl7mllp" level="INFO"/>
-  <logger name="org.apache.kafka" level="WARN"/>
-  <logger name="ca.uhn.hl7v2" level="WARN"/>
+  <logger name="org.apache.kafka" level="INFO"/>
+  <logger name="ca.uhn.hl7v2" level="INFO"/>
+  <logger name="ca.uhn.hl7v2.llp" level="INFO"/>
+  <logger name="ca.uhn.hl7v2.app" level="INFO"/>
 </configuration>
