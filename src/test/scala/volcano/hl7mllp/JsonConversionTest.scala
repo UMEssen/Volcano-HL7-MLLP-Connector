@@ -13,8 +13,8 @@ object JsonConversionTest:
     // Parse the HL7 message
     val msg = pipeParser.parse(sampleHL7)
 
-    // Convert to JSON using Main's method
-    val json = Main.messageToJson(msg, pipeParser)
+    // Convert to JSON using the dedicated converter
+    val json = HL7ToJsonConverter.convert(msg, pipeParser)
 
     println("=" * 80)
     println("JSON OUTPUT:")

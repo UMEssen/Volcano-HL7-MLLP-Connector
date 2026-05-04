@@ -3,14 +3,17 @@
 # Stage 1: Build the application using pre-built JAR
 FROM eclipse-temurin:25-jdk-noble AS builder
 
+# Pipefail so the `curl … | apt-key add` chain below fails loud on a curl error.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # Install SBT
 RUN apt-get update && \
-    apt-get install -y curl gnupg && \
+    apt-get install -y --no-install-recommends curl gnupg && \
     echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | tee /etc/apt/sources.list.d/sbt.list && \
     echo "deb https://repo.scala-sbt.org/scalasbt/debian /" | tee /etc/apt/sources.list.d/sbt_old.list && \
-    curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | apt-key add && \
+    curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | apt-key add - && \
     apt-get update && \
-    apt-get install -y sbt && \
+    apt-get install -y --no-install-recommends sbt && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
