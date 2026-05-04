@@ -24,7 +24,6 @@ object Main:
 
       log.info(s"Starting Volcano HL7 MLLP connector on port ${cfg.port}, TLS=${cfg.useTls}, Kafka=${cfg.kafkaBootstrap}, prefix='${cfg.topicPrefix}', infix='${cfg.topicInfix}'")
       log.info(s"HL7 MLLP Charset configured: ${cfg.hl7Encoding}")
-      log.info(s"Kafka topic naming strategy: ${cfg.kafkaTopicName} (${if cfg.kafkaTopicName == "message_structure" then "HL7 v2.5+" else "HL7 v2.x legacy"})")
 
       // Configure HAPI context with proper character encoding
       val hapiCtx = new DefaultHapiContext()
@@ -55,8 +54,8 @@ object Main:
           try
             // Parse quickly and avoid logging PHI
             val terser = new Terser(in)
-            val key    = HL7MessageProcessor.messageKey(terser, cfg.kafkaTopicName)
-            val topics = HL7MessageProcessor.topicNames(cfg.topicPrefix, cfg.topicInfix, terser, cfg.kafkaTopicName)
+            val key    = HL7MessageProcessor.messageKey(terser)
+            val topics = HL7MessageProcessor.topicNames(cfg.topicPrefix, cfg.topicInfix, terser)
             val info   = HL7MessageProcessor.messageInfo(terser)
 
             log.info(s"Received HL7 message: key=$key struct=$info")

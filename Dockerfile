@@ -50,7 +50,6 @@ ENV MLLP_PORT=2575 \
     KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
     KAFKA_TOPIC_PREFIX=volcano. \
     KAFKA_TOPIC_INFIX=hl7.v2. \
-    KAFKA_TOPIC_NAME=legacy \
     KAFKA_CLIENT_ID=volcano-hl7-mllp \
     KAFKA_ACK_TIMEOUT_MS=5000 \
     KAFKA_SASL_ENABLED=false \

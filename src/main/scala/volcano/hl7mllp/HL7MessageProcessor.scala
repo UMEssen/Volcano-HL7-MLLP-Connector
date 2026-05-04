@@ -10,31 +10,20 @@ object HL7MessageProcessor:
   private def field(terser: Terser, path: String): String =
     Option(terser.get(path)).map(_.trim).filter(_.nonEmpty).getOrElse("UNKNOWN")
 
-  def topicNames(prefix: String, infix: String, terser: Terser, topicNameStrategy: String): Seq[String] =
-    val topic = topicNameStrategy match
-      case "message_structure" =>
-        // MSH-9.3 is message structure (ADT_A01, ORU_R01, etc.) - required in HL7 v2.5+
-        s"${prefix}${infix}${sanitize(field(terser, "/MSH-9-3"))}".toLowerCase
+  // Topic name = {prefix}{infix}{type}.{event}. Uses MSH-9.1 (message type)
+  // and MSH-9.2 (trigger event) — both mandatory in every HL7 v2.x version
+  // (pre-2.5 and 2.5+), so this single path covers all senders.
+  def topicNames(prefix: String, infix: String, terser: Terser): Seq[String] =
+    val typ   = sanitize(field(terser, "/MSH-9-1"))
+    val event = sanitize(field(terser, "/MSH-9-2"))
+    Seq(s"${prefix}${infix}${typ}.${event}".toLowerCase)
 
-      case _ => // "legacy" or default
-        // MSH-9.1 is message type (ADT/ORU/ORM...), MSH-9.2 is trigger event (A01/R01...)
-        // Compatible with HL7 v2.x versions prior to v2.5 (MSH-9.3 not required)
-        val typ   = sanitize(field(terser, "/MSH-9-1"))
-        val event = sanitize(field(terser, "/MSH-9-2"))
-        s"${prefix}${infix}${typ}.${event}".toLowerCase
-
-    Seq(topic)
-
-  def messageKey(terser: Terser, topicNameStrategy: String): String =
-    // Prefer MSH-10 message control ID; fallback depends on topic naming strategy
+  // Kafka partition key = MSH-10 (message control ID); fallback to a
+  // synthetic key that includes the message type/event so partitioning
+  // still groups same-kind messages on retries.
+  def messageKey(terser: Terser): String =
     val mcid = Option(terser.get("/MSH-10")).filter(s => s != null && s.nonEmpty)
-    mcid.getOrElse {
-      topicNameStrategy match
-        case "message_structure" =>
-          s"${field(terser, "/MSH-9-3")}-${System.currentTimeMillis()}"
-        case _ => // "legacy" or default
-          s"${field(terser, "/MSH-9-1")}.${field(terser, "/MSH-9-2")}-${System.currentTimeMillis()}"
-    }
+    mcid.getOrElse(s"${field(terser, "/MSH-9-1")}.${field(terser, "/MSH-9-2")}-${System.currentTimeMillis()}")
 
   def messageInfo(terser: Terser): String =
     val t  = Option(terser.get("/MSH-9-1")).getOrElse("?")
