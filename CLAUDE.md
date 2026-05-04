@@ -52,6 +52,7 @@ Key environment variables (see `.env.example` or `docker-compose.yml`):
 - `HL7_ENCODING` - Character encoding for HL7 messages (default: UTF-8). Supports UTF-8, ISO-8859-1, windows-1252, US-ASCII
 - `KAFKA_BOOTSTRAP_SERVERS` - Kafka broker addresses
 - `KAFKA_TOPIC_PREFIX` - Prefix for generated topics (default: "volcano.")
+- `KAFKA_TOPIC_INFIX` - Inserted between prefix and {type}.{event} or {structure} (default: "hl7.v2."). Set to "" when the prefix already encodes the protocol/version segments.
 - `KAFKA_TOPIC_NAME` - Topic naming strategy: "legacy" or "message_structure" (default: "legacy")
 - `KAFKA_SASL_ENABLED` - Enable SASL authentication (default: false)
 - `KAFKA_SASL_MECHANISM` - SASL mechanism (default: SCRAM-SHA-512)
@@ -84,8 +85,8 @@ The connector supports two routing strategies controlled by the `KAFKA_TOPIC_NAM
 **1. Legacy Mode (default: `KAFKA_TOPIC_NAME=legacy`)**
 - **HL7 Version Support**: All HL7 v2.x versions (including pre-v2.5)
 - **Fields Used**: MSH-9.1 (message type) and MSH-9.2 (trigger event)
-- **Topic Format**: `{prefix}hl7.v2.{type}.{event}`
-- **Example**: `volcano.hl7.v2.adt.a01`
+- **Topic Format**: `{prefix}{infix}{type}.{event}`
+- **Example**: `volcano.hl7.v2.adt.a01` (default infix `hl7.v2.`)
 - **Fallback**: Uses "UNKNOWN" for missing fields (e.g., `volcano.hl7.v2.unknown.a01`)
 - **Use Case**: Environments with older HL7 v2 messages that may not populate MSH-9.3
 - **Message Key Fallback**: `{type}.{event}-{timestamp}` (e.g., `ADT.A01-1234567890`)
@@ -93,12 +94,23 @@ The connector supports two routing strategies controlled by the `KAFKA_TOPIC_NAM
 **2. Message Structure Mode (`KAFKA_TOPIC_NAME=message_structure`)**
 - **HL7 Version Support**: HL7 v2.5 and later (MSH-9.3 is required in v2.5+)
 - **Fields Used**: MSH-9.3 (message structure)
-- **Topic Format**: `{prefix}hl7.v2.{structure}`
-- **Example**: `volcano.hl7.v2.adt_a01`
+- **Topic Format**: `{prefix}{infix}{structure}`
+- **Example**: `volcano.hl7.v2.adt_a01` (default infix `hl7.v2.`)
 - **Fallback**: Uses "UNKNOWN" if MSH-9.3 is missing (e.g., `volcano.hl7.v2.unknown`)
 - **Use Case**: Modern HL7 v2.5+ environments where MSH-9.3 is reliably populated
 - **Message Key Fallback**: `{structure}-{timestamp}` (e.g., `ADT_A01-1234567890`)
 - **Advantage**: More precise routing as structure field explicitly defines the message structure
+
+### Configurable `hl7.v2.` Infix
+
+Both strategies insert `KAFKA_TOPIC_INFIX` (default `hl7.v2.`) between the prefix and the message-derived suffix. Set it to empty when you'd rather encode the protocol/version segments inside the prefix itself:
+
+```
+KAFKA_TOPIC_PREFIX=volcano.producer.hl7.v2.cgm.medico.
+KAFKA_TOPIC_INFIX=
+KAFKA_TOPIC_NAME=legacy
+# → volcano.producer.hl7.v2.cgm.medico.adt.a01
+```
 
 ### Message Key Strategy
 Uses MSH-10 (message control ID) as Kafka partition key for ordering. Fallback depends on routing strategy:

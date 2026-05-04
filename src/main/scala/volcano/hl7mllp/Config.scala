@@ -5,6 +5,7 @@ final case class Config(
   useTls: Boolean,
   kafkaBootstrap: String,
   topicPrefix: String,
+  topicInfix: String,
   kafkaTopicName: String,
   kafkaClientId: String,
   kafkaAcksTimeoutMs: Int,
@@ -28,6 +29,11 @@ object Config:
       useTls             = env("MLLP_TLS", "false").toBoolean, // plain by default
       kafkaBootstrap     = env("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
       topicPrefix        = sanitizePrefix(env("KAFKA_TOPIC_PREFIX", "volcano.")),
+      // Inserted between prefix and {type}.{event} (or {structure}). Default
+      // preserves the historical schema "volcano.hl7.v2.adt.a01"; set empty
+      // to bake the protocol/version segments into the prefix instead and
+      // emit "<prefix>{type}.{event}" verbatim.
+      topicInfix         = env("KAFKA_TOPIC_INFIX", "hl7.v2."),
       kafkaTopicName     = env("KAFKA_TOPIC_NAME", "legacy").toLowerCase,
       kafkaClientId      = env("KAFKA_CLIENT_ID", "volcano-hl7-mllp"),
       kafkaAcksTimeoutMs = env("KAFKA_ACK_TIMEOUT_MS", "5000").toInt,
