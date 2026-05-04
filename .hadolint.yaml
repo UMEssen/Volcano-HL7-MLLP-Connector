@@ -1,0 +1,10 @@
+# Hadolint configuration.
+#
+# Ignored rules:
+#   DL3008 — "Pin versions in apt get install". On Ubuntu the package archive
+#            rotates often; pinning curl/gnupg/sbt to specific versions makes
+#            the build break every time Canonical publishes a security update.
+#            We accept floating apt versions and rely on the Ubuntu-provided
+#            base-image refresh cadence to pull patches.
+ignored:
+  - DL3008

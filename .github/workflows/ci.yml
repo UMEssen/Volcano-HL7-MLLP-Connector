@@ -33,7 +33,9 @@ env:
   JAVA_DISTRIBUTION: temurin
   SBT_OPTS: "-Xmx2g -Dfile.encoding=UTF-8"
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/volcano-hl7-mllp
+  # GHCR requires the image name to be lowercase; github.repository_owner
+  # preserves the org's original casing (UMEssen), so we hardcode here.
+  IMAGE_NAME: umessen/volcano-hl7-mllp
 
 jobs:
   lint:
@@ -174,7 +176,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: scan-target:ci
           format: table
