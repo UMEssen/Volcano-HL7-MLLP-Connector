@@ -1,0 +1,196 @@
+# CI for the Volcano HL7 MLLP Connector.
+#
+# Pipeline:
+#   lint     — hadolint on the Dockerfile.
+#   test     — sbt compile + JSON conversion smoke test.
+#   build    — sbt assembly (uploads the fat JAR as a workflow artifact).
+#   container — buildx multi-stage image build + Trivy scan; pushes to
+#               ghcr.io/umessen/volcano-hl7-mllp on main pushes and tags.
+#
+# Production image flows to the air-gapped Nexus
+# (local-proprietary.docker.nexus.ship.ume.de) via a separate
+# replication/sync job — not done here.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same ref except for main / tags so the
+# release path always completes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: "25"
+  JAVA_DISTRIBUTION: temurin
+  SBT_OPTS: "-Xmx2g -Dfile.encoding=UTF-8"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/volcano-hl7-mllp
+
+jobs:
+  lint:
+    name: Lint Dockerfile
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+  test:
+    name: Compile + smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache sbt / coursier / ivy
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.sbt
+            ~/.cache/coursier
+            ~/.ivy2/cache
+          key: ${{ runner.os }}-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties', 'project/plugins.sbt') }}
+          restore-keys: |
+            ${{ runner.os }}-sbt-
+
+      - name: Compile (main + test)
+        run: sbt -batch "Test/compile"
+
+      - name: JSON conversion smoke test
+        run: sbt -batch "Test/runMain volcano.hl7mllp.JsonConversionTest"
+
+  build:
+    name: Build fat JAR
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: sbt/setup-sbt@v1
+
+      - name: Cache sbt / coursier / ivy
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.sbt
+            ~/.cache/coursier
+            ~/.ivy2/cache
+          key: ${{ runner.os }}-sbt-${{ hashFiles('**/*.sbt', 'project/build.properties', 'project/plugins.sbt') }}
+          restore-keys: |
+            ${{ runner.os }}-sbt-
+
+      - name: Assemble fat JAR
+        run: sbt -batch assembly
+
+      - name: Locate JAR
+        id: jar
+        run: |
+          jar=$(ls target/scala-*/volcano-connector-hl7-mllp-assembly-*.jar | head -n1)
+          echo "path=$jar" >> "$GITHUB_OUTPUT"
+          echo "Built: $jar ($(du -h "$jar" | cut -f1))"
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: volcano-connector-hl7-mllp-jar
+          path: ${{ steps.jar.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+  container:
+    name: Container image
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # for cosign / OIDC if added later
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Tags: branch + PR + semver from git tags + sha.
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.title=Volcano HL7 MLLP Connector
+            org.opencontainers.image.description=HL7 v2 over MLLP -> Kafka bridge
+            org.opencontainers.image.vendor=UMEssen
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build once, load into the local docker daemon for Trivy to scan.
+      - name: Build (load only)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: scan-target:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: scan-target:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
+
+      # Build + push the real tags only when the scan above passed.
+      - name: Build + push (real tags)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
