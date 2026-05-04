@@ -79,7 +79,7 @@ The entire connector logic is in `src/main/scala/volcano/hl7mllp/Main.scala` (~1
 
 ### Routing Strategies
 
-The connector supports two routing strategies controlled by the `KAFKA_TOPIC_NAME` environment variable:
+The connector supports three routing strategies controlled by the `KAFKA_TOPIC_NAME` environment variable:
 
 **1. Legacy Mode (default: `KAFKA_TOPIC_NAME=legacy`)**
 - **HL7 Version Support**: All HL7 v2.x versions (including pre-v2.5)
@@ -99,6 +99,15 @@ The connector supports two routing strategies controlled by the `KAFKA_TOPIC_NAM
 - **Use Case**: Modern HL7 v2.5+ environments where MSH-9.3 is reliably populated
 - **Message Key Fallback**: `{structure}-{timestamp}` (e.g., `ADT_A01-1234567890`)
 - **Advantage**: More precise routing as structure field explicitly defines the message structure
+
+**3. Structure Mode (`KAFKA_TOPIC_NAME=structure`)**
+- **HL7 Version Support**: HL7 v2.5 and later
+- **Fields Used**: MSH-9.3 (message structure)
+- **Topic Format**: `{prefix}{structure}` — no `hl7.v2.` infix
+- **Example**: with `KAFKA_TOPIC_PREFIX=volcano.producer.hl7.cgm.medico.` produces `volcano.producer.hl7.cgm.medico.adt_a01`
+- **Fallback**: Uses "UNKNOWN" if MSH-9.3 is missing
+- **Use Case**: Hierarchical schemas where the prefix already encodes the protocol/version (`<env>.<producer-class>.<protocol>.<sender>.`). Avoids the duplicate-`hl7` repetition that `message_structure` would produce in such schemas.
+- **Message Key Fallback**: same as `message_structure` — `{structure}-{timestamp}`
 
 ### Message Key Strategy
 Uses MSH-10 (message control ID) as Kafka partition key for ordering. Fallback depends on routing strategy:
