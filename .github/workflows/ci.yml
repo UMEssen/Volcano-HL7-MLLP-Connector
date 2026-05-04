@@ -6,10 +6,6 @@
 #   build    — sbt assembly (uploads the fat JAR as a workflow artifact).
 #   container — buildx multi-stage image build + Trivy scan; pushes to
 #               ghcr.io/umessen/volcano-hl7-mllp on main pushes and tags.
-#
-# Production image flows to the air-gapped Nexus
-# (local-proprietary.docker.nexus.ship.ume.de) via a separate
-# replication/sync job — not done here.
 name: CI
 
 on:
