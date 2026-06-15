@@ -68,12 +68,16 @@ object Metrics:
     produceFailures.labels("hl7_parse")
     produceFailures.labels("other")
 
-  def start(port: Int): HttpServer =
+  // isLive should report true only while the MLLP listener is actually
+  // running — so /healthz is true MLLP liveness, not just "the process is up".
+  // It is deliberately NOT tied to Kafka: a Kafka outage must keep the pod
+  // ready so it accepts and NAKs (the sender then buffers/retries).
+  def start(port: Int, isLive: () => Boolean = () => true): HttpServer =
     DefaultExports.initialize() // JVM + process metrics
     warmup()
     val server = HttpServer.create(new InetSocketAddress(port), 0)
     server.createContext("/metrics", new MetricsHandler)
-    server.createContext("/healthz", new OkHandler)
+    server.createContext("/healthz", new HealthHandler(isLive))
     server.createContext("/", new OkHandler)
     server.setExecutor(null)
     server.start()
@@ -100,5 +104,16 @@ object Metrics:
     override def handle(ex: HttpExchange): Unit =
       val bytes = "ok".getBytes(UTF_8)
       ex.sendResponseHeaders(200, bytes.length.toLong)
+      val os = ex.getResponseBody
+      try os.write(bytes) finally os.close()
+
+  // 200 only while the MLLP listener is up; 503 otherwise (-> k8s restarts on
+  // liveness, drops from the Service on readiness). Any error in the check is
+  // treated as not-live, fail-safe.
+  private class HealthHandler(isLive: () => Boolean) extends HttpHandler:
+    override def handle(ex: HttpExchange): Unit =
+      val live = try isLive() catch case _: Throwable => false
+      val bytes = (if live then "ok" else "mllp listener not running").getBytes(UTF_8)
+      ex.sendResponseHeaders(if live then 200 else 503, bytes.length.toLong)
       val os = ex.getResponseBody
       try os.write(bytes) finally os.close()

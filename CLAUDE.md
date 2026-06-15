@@ -128,7 +128,9 @@ Uses MSH-10 (message control ID) as the Kafka partition key. **Deliberately not 
 - **Graceful Shutdown**: Flushes and closes producer, stops MLLP server + metrics server cleanly
 
 ### Observability (Metrics)
-`Metrics.scala` runs a Prometheus exporter on `METRICS_PORT` (default 9404): `/metrics` (text format) and `/healthz`. App metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processed_total{result=ack|nak}`, `hl7_kafka_produced_total{topic}`, `hl7_kafka_produce_failures_total{reason=timeout|record_too_large|hl7_parse|other}`, `hl7_kafka_produce_duration_seconds` (histogram), `hl7_messages_in_flight`, plus JVM/process metrics. **Why metrics, not probes:** the k8s liveness/readiness probes are TCP-on-MLLP and stay green during a Kafka outage (intentional — keep accepting so the sender buffers). Pipeline health is only visible via the produce-failure metric, so alert on that.
+`Metrics.scala` runs a Prometheus exporter on `METRICS_PORT` (default 9404): `/metrics` (text format) and `/healthz`. App metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processed_total{result=ack|nak}`, `hl7_kafka_produced_total{topic}`, `hl7_kafka_produce_failures_total{reason=timeout|record_too_large|hl7_parse|other}`, `hl7_kafka_produce_duration_seconds` (histogram), `hl7_messages_in_flight`, plus JVM/process metrics.
+
+**`/healthz` = MLLP-listener liveness, NOT Kafka.** It returns 200 only while the HAPI `HL7Service` `isRunning()` (wired via an `AtomicReference` set in `Main`), 503 otherwise — so the k8s probes restart/drain a pod whose listener died, but a **Kafka outage keeps it green** (the connector must keep accepting and NAK so the sender buffers/retries). Pipeline (Kafka) health is therefore only visible via `hl7_kafka_produce_failures_total` — alert on that, not on pod health.
 
 ### Character Encoding
 Configuration in Main.scala:224-226:
