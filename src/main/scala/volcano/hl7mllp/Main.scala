@@ -38,8 +38,13 @@ object Main:
       log.info(s"Starting Volcano HL7 MLLP connector on port ${cfg.port}, TLS=${cfg.useTls}, Kafka=${cfg.kafkaBootstrap}, routing: $routing")
       log.info(s"HL7 MLLP Charset configured: ${cfg.hl7Encoding}, includeRaw=${cfg.includeRaw}")
 
+      // /healthz reads MLLP-listener liveness through this ref: false until the
+      // HL7Service is created and started, true while it runs, false once it
+      // stops — so the probe reflects the actual listener, not just the JVM.
+      val serverRef = new java.util.concurrent.atomic.AtomicReference[HL7Service]()
       val metricsServer =
-        if cfg.metricsEnabled then Some(Metrics.start(cfg.metricsPort))
+        if cfg.metricsEnabled then
+          Some(Metrics.start(cfg.metricsPort, () => Option(serverRef.get()).exists(_.isRunning())))
         else { log.info("Metrics disabled (METRICS_ENABLED=false)"); None }
 
       // Configure HAPI context with proper character encoding
@@ -63,6 +68,7 @@ object Main:
 
       log.info(s"Creating MLLP server on port ${cfg.port}...")
       val server: HL7Service = hapiCtx.newServer(cfg.port, cfg.useTls)
+      serverRef.set(server) // expose to /healthz; isRunning() flips true at server.start()
 
       // Application handler
       val app = new ReceivingApplication[Message]:
