@@ -7,9 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Volcano connector that listens for HL7 v2 messages over MLLP (Minimum Lower Layer Protocol), parses them to JSON using HAPI, and publishes to Kafka topics based on message structure/type. This is a healthcare data integration component written in Scala 3.
 
 **Key Technologies:**
-- Scala 3.3.3
+- Scala 3.3.7
 - HAPI (HL7 v2 parser library)
 - Apache Kafka clients
+- Prometheus simpleclient (metrics)
 - SBT build system
 - Logback for logging
 
@@ -49,10 +50,17 @@ docker-compose up    # Containerized with Kafka
 Key environment variables (see `.env.example` or `docker-compose.yml`):
 - `MLLP_PORT` - Port to listen on (default: 2575)
 - `MLLP_TLS` - Enable TLS (default: false)
-- `HL7_ENCODING` - Character encoding for HL7 messages (default: UTF-8). Supports UTF-8, ISO-8859-1, windows-1252, US-ASCII
+- `HL7_ENCODING` - Character encoding for HL7 messages (default: UTF-8). Supports UTF-8, ISO-8859-1, windows-1252, US-ASCII. **MSH-18 (declared charset) is ignored** — match this to what the sender emits.
+- `HL7_INCLUDE_RAW` - Include the raw ER7 string in the JSON envelope (default: true)
 - `KAFKA_BOOTSTRAP_SERVERS` - Kafka broker addresses
-- `KAFKA_TOPIC_PREFIX` - Prefix for generated topics (default: "volcano.")
-- `KAFKA_TOPIC_INFIX` - Inserted between prefix and {type}.{event} (default: "hl7.v2."). Set to "" when the prefix already encodes the protocol/version segments.
+- `KAFKA_TOPIC` - **Static topic** (default: unset). When set, every message routes here and MSH-9 is used only for key/headers/metadata. Preferred for feed-based deployments. When unset, the derived `{prefix}{infix}{type}.{event}` scheme below applies.
+- `KAFKA_TOPIC_PREFIX` - Prefix for derived topics (default: "volcano.")
+- `KAFKA_TOPIC_INFIX` - Inserted between prefix and {type}.{event} (default: "hl7.v2."). Set to "" when the prefix already encodes the protocol/version segments. Ignored when `KAFKA_TOPIC` is set.
+- `KAFKA_MAX_REQUEST_SIZE` - Client-side max record size in bytes (default: 10485760 / 10 MiB). Must be ≥ the topic's `max.message.bytes`; the Kafka default of 1 MiB silently NAKs document-bearing HL7.
+- `KAFKA_BUFFER_MEMORY` - Producer buffer in bytes (default: 67108864 / 64 MiB)
+- `KAFKA_COMPRESSION_TYPE` - Producer compression (default: lz4)
+- `METRICS_ENABLED` - Expose Prometheus metrics + health (default: true)
+- `METRICS_PORT` - Port for `/metrics` and `/healthz` (default: 9404)
 - `KAFKA_SASL_ENABLED` - Enable SASL authentication (default: false)
 - `KAFKA_SASL_MECHANISM` - SASL mechanism (default: SCRAM-SHA-512)
 - `KAFKA_SASL_USERNAME` - SASL username (required if SASL enabled)
@@ -63,13 +71,20 @@ Key environment variables (see `.env.example` or `docker-compose.yml`):
 
 ## Architecture
 
-### Single-File Application
-The entire connector logic is in `src/main/scala/volcano/hl7mllp/Main.scala` (~148 lines).
+### Module Layout
+The connector is split into focused single-responsibility files under `src/main/scala/volcano/hl7mllp/`:
+- `Main.scala` — wiring: HAPI context, MLLP server, the `ReceivingApplication` handler, shutdown hook.
+- `Config.scala` — environment-variable configuration (`Config.load()`).
+- `KafkaProducerFactory.scala` — builds the producer (reliability, sizing, SASL/SSL).
+- `HL7MessageProcessor.scala` — topic resolution (static vs derived), partition key, Kafka headers.
+- `HL7ToJsonConverter.scala` — HAPI message → JSON envelope (compact, `schema_version`).
+- `HL7AckGenerator.scala` — AA/AE acknowledgments.
+- `Metrics.scala` — Prometheus registry + embedded `/metrics` and `/healthz` HTTP server.
 
 ### Core Flow
 1. **MLLP Listener** - HAPI HL7Service listens on configured port for incoming HL7 v2 messages
 2. **Message Parsing** - Uses HAPI Terser to extract MSH segment fields (message type, trigger event, or structure)
-3. **Topic Routing** - Routes to Kafka topics based on configurable routing strategy (see Routing Strategies below)
+3. **Topic Routing** - Static (`KAFKA_TOPIC`) or derived from MSH-9 (see Topic Naming below)
 4. **JSON Conversion** - Custom converter creates structured JSON with:
    - `hl7_raw`: Original ER7 pipe-delimited format
    - `metadata`: Extracted key fields (message type, control ID, sending/receiving systems, etc.)
@@ -79,34 +94,41 @@ The entire connector logic is in `src/main/scala/volcano/hl7mllp/Main.scala` (~1
 
 ### Topic Naming
 
-Single naming scheme: `{prefix}{infix}{type}.{event}` where:
+Two modes, resolved in `HL7MessageProcessor.topicName`:
 
+**1. Static (preferred for feed-based deployments).** Set `KAFKA_TOPIC` and every message from this instance is produced to that exact topic. MSH-9 never touches routing — so even a message too malformed to parse MSH-9 still lands in the right topic. This is the model for a feed-based deployment: one connector instance per upstream feed, topic identity derived from the *feed* (which the operator controls), not the message type (which the upstream can change without notice). The message type/event still travel in the Kafka headers and JSON payload.
+
+**2. Derived (fallback when `KAFKA_TOPIC` is unset).** `{prefix}{infix}{type}.{event}` where:
 - `{type}` = MSH-9.1 (message type, e.g. ADT, ORU, ORM)
 - `{event}` = MSH-9.2 (trigger event, e.g. A01, R01, O01)
 - `{prefix}` = `KAFKA_TOPIC_PREFIX` (default `volcano.`)
 - `{infix}` = `KAFKA_TOPIC_INFIX` (default `hl7.v2.`; set to empty to suppress)
 
-**Why MSH-9.1/9.2 only and not MSH-9.3?** Both fields are *mandatory in every HL7 v2.x version* (including pre-2.5), so a single code path covers all senders. MSH-9.3 (message structure) is only required from v2.5 onward and would force a sender-version branch for marginal benefit (`adt.a01` vs `adt_a01` is essentially cosmetic — both convey the same information).
+**Why MSH-9.1/9.2 only and not MSH-9.3?** Both fields are *mandatory in every HL7 v2.x version* (including pre-2.5), so a single code path covers all senders. MSH-9.3 (message structure) is only required from v2.5 onward and would force a sender-version branch for marginal benefit.
 
 **Examples:**
 
-| `KAFKA_TOPIC_PREFIX` | `KAFKA_TOPIC_INFIX` | Resulting topic for ADT^A01 |
-|---------------------|---------------------|------------------------------|
-| `volcano.` (default) | `hl7.v2.` (default) | `volcano.hl7.v2.adt.a01` |
-| `volcano.producer.hl7.v2.cgm.medico.` | `` (empty) | `volcano.producer.hl7.v2.cgm.medico.adt.a01` |
+| Mode | Config | Resulting topic for ADT^A01 |
+|------|--------|------------------------------|
+| Static | `KAFKA_TOPIC=volcano.producer.hl7.v2.example.adt` | `volcano.producer.hl7.v2.example.adt` |
+| Derived | `KAFKA_TOPIC_PREFIX=volcano.`, `KAFKA_TOPIC_INFIX=hl7.v2.` | `volcano.hl7.v2.adt.a01` |
 
-**Fallback for missing fields:** `UNKNOWN` (e.g. `prefix.infix.unknown.a01`).
-**Message key fallback when MSH-10 is empty:** `{type}.{event}-{timestamp}` so retried messages with the same trigger still hash to the same partition.
+**Derived-mode fallback for missing MSH-9 fields:** `UNKNOWN` (e.g. `prefix.infix.unknown.a01`).
+
+### Kafka Headers
+Every record carries headers so a downstream router can dispatch/dedupe without deserializing the body (`HL7MessageProcessor.headers`): `hl7.message_type`, `hl7.trigger_event`, `hl7.message_structure`, `hl7.message_control_id`, `hl7.version`, `hl7.sending_application`, `content_type=application/json`, `schema_version`.
 
 ### Message Key Strategy
-Uses MSH-10 (message control ID) as Kafka partition key for ordering. Fallback depends on routing strategy:
-- **Legacy mode**: `{type}.{event}-{timestamp}` (e.g., `ADT.A01-1234567890`)
-- **Message structure mode**: `{structure}-{timestamp}` (e.g., `ADT_A01-1234567890`)
+Uses MSH-10 (message control ID) as the Kafka partition key. **Deliberately not the patient ID** — the key is stored in cleartext in the partition log and printed by Kafka tooling, so a raw patient identifier there would be a PHI leak (and would surface in this connector's own log lines). MSH-10 is unique-per-message and non-PHI, and doubles as the consumer **dedup key** for the at-least-once resend an ack-timeout can cause. Fallback when MSH-10 is empty: `{type}.{event}-{timestamp}`.
 
 ### Reliability Design
 - **Kafka Producer Config**: `acks=all`, idempotence enabled, max retries, 5 in-flight requests
-- **Synchronous Send**: Waits for Kafka confirmation before ACKing to sender (max 5s timeout)
-- **Graceful Shutdown**: Flushes and closes producer, stops MLLP server cleanly
+- **Message sizing**: `max.request.size`/`buffer.memory` raised above the 1 MiB client default (document feeds), `compression.type=lz4`, `max.block.ms` bounded to the ack timeout so a Kafka outage fails fast instead of stalling the serial MLLP thread
+- **Synchronous Send**: Waits for Kafka confirmation before ACKing to sender (timeout = `KAFKA_ACK_TIMEOUT_MS`); on any failure returns AE so the upstream sender buffers and retries — durability is intentionally pushed back to the sender
+- **Graceful Shutdown**: Flushes and closes producer, stops MLLP server + metrics server cleanly
+
+### Observability (Metrics)
+`Metrics.scala` runs a Prometheus exporter on `METRICS_PORT` (default 9404): `/metrics` (text format) and `/healthz`. App metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processed_total{result=ack|nak}`, `hl7_kafka_produced_total{topic}`, `hl7_kafka_produce_failures_total{reason=timeout|record_too_large|hl7_parse|other}`, `hl7_kafka_produce_duration_seconds` (histogram), `hl7_messages_in_flight`, plus JVM/process metrics. **Why metrics, not probes:** the k8s liveness/readiness probes are TCP-on-MLLP and stay green during a Kafka outage (intentional — keep accepting so the sender buffers). Pipeline health is only visible via the produce-failure metric, so alert on that.
 
 ### Character Encoding
 Configuration in Main.scala:224-226:
@@ -222,12 +244,10 @@ This strategy ensures SLF4J 2.x can discover the Logback implementation via Serv
 
 ## Testing Considerations
 
-A simple test exists in `src/test/scala/volcano/hl7mllp/JsonConversionTest.scala` to verify JSON output.
+- **`RoutingSuite.scala`** — MUnit unit tests for topic resolution (static/derived), partition key + fallback, Kafka headers, and the JSON envelope. Run with `sbt test`.
+- **`JsonConversionTest.scala`** — a `runMain` smoke test that parses a sample message and prints/asserts the JSON envelope. Run with `sbt "Test/runMain volcano.hl7mllp.JsonConversionTest"`.
 
-Run the test:
-```bash
-sbt "Test/runMain volcano.hl7mllp.JsonConversionTest"
-```
+CI (`.github/workflows/ci.yml`) runs both, plus: hadolint, a CycloneDX **SBOM** (Syft) of the image, **Trivy** scan with SARIF upload to the Security tab, sbt **dependency-graph submission** (feeds Dependabot/GitHub Advisory alerts), and **dependency-review** on PRs. Third-party actions are pinned to commit SHAs (Dependabot bumps them).
 
 When adding more tests:
 - Mock HL7Service and KafkaProducer for unit testing
