@@ -34,6 +34,15 @@ RUN sbt assembly
 # Stage 2: Runtime image
 FROM eclipse-temurin:25-jre-noble
 
+# Patch OS packages for known-fixable CVEs (e.g. openssl/libssl) that the base
+# image layer hasn't picked up yet — the Trivy gate in CI enforces this.
+# hadolint DL3005 (avoid apt-get upgrade) is intentionally ignored: for a
+# regularly-rebuilt image, patching the base beats shipping a stale layer.
+# hadolint ignore=DL3005
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    rm -rf /var/lib/apt/lists/*
+
 # Create non-root user and directories
 RUN groupadd -r volcano && useradd -r -g volcano volcano && \
     mkdir -p /app/certs
