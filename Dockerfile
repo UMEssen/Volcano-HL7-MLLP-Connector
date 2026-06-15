@@ -34,6 +34,15 @@ RUN sbt assembly
 # Stage 2: Runtime image
 FROM eclipse-temurin:25-jre-noble
 
+# Patch OS packages for known-fixable CVEs (e.g. openssl/libssl) that the base
+# image layer hasn't picked up yet — the Trivy gate in CI enforces this.
+# hadolint DL3005 (avoid apt-get upgrade) is intentionally ignored: for a
+# regularly-rebuilt image, patching the base beats shipping a stale layer.
+# hadolint ignore=DL3005
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    rm -rf /var/lib/apt/lists/*
+
 # Create non-root user and directories
 RUN groupadd -r volcano && useradd -r -g volcano volcano && \
     mkdir -p /app/certs
@@ -47,20 +56,27 @@ COPY --from=builder /build/target/scala-*/*-assembly-*.jar /app/volcano-connecto
 ENV MLLP_PORT=2575 \
     MLLP_TLS=false \
     HL7_ENCODING=UTF-8 \
+    HL7_INCLUDE_RAW=true \
     KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+    KAFKA_TOPIC="" \
     KAFKA_TOPIC_PREFIX=volcano. \
     KAFKA_TOPIC_INFIX=hl7.v2. \
     KAFKA_CLIENT_ID=volcano-hl7-mllp \
     KAFKA_ACK_TIMEOUT_MS=5000 \
+    KAFKA_MAX_REQUEST_SIZE=10485760 \
+    KAFKA_BUFFER_MEMORY=67108864 \
+    KAFKA_COMPRESSION_TYPE=lz4 \
     KAFKA_SASL_ENABLED=false \
     KAFKA_SASL_MECHANISM=SCRAM-SHA-512 \
     KAFKA_SSL_ENABLED=false \
     KAFKA_SSL_TRUSTSTORE_LOCATION=/app/certs/ca-cert.pem \
     KAFKA_SSL_TRUSTSTORE_TYPE=PEM \
+    METRICS_ENABLED=true \
+    METRICS_PORT=9404 \
     JAVA_OPTS="-Xmx512m -Xms256m"
 
-# Expose MLLP port
-EXPOSE 2575
+# Expose MLLP port + Prometheus metrics port
+EXPOSE 2575 9404
 
 # Switch to non-root user
 RUN chown -R volcano:volcano /app && \

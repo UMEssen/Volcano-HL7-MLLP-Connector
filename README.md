@@ -33,7 +33,7 @@ The connector will be available on port **2575** and Kafka UI on **http://localh
 
 ### Prerequisites
 
-- Java 11+
+- Java 21+ (CI and the Docker image use 25)
 - SBT 1.x
 - Kafka cluster (or use docker-compose)
 
@@ -73,38 +73,44 @@ Configure via environment variables:
 |----------|---------|-------------|
 | `MLLP_PORT` | `2575` | Port to listen on for MLLP connections |
 | `MLLP_TLS` | `false` | Enable TLS for MLLP (set to `true` for encrypted) |
-| `HL7_ENCODING` | `UTF-8` | Character encoding (UTF-8, ISO-8859-1, windows-1252, US-ASCII) |
+| `HL7_ENCODING` | `UTF-8` | Character encoding (UTF-8, ISO-8859-1, windows-1252, US-ASCII). MSH-18 is ignored. |
+| `HL7_INCLUDE_RAW` | `true` | Include the raw ER7 string in the JSON envelope |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker addresses |
-| `KAFKA_TOPIC_PREFIX` | `volcano.` | Prefix for generated topic names |
-| `KAFKA_TOPIC_NAME` | `legacy` | Topic naming strategy: `legacy` or `message_structure` |
+| `KAFKA_TOPIC` | _(unset)_ | **Static topic.** When set, all messages route here (feed-based model). Overrides the derived scheme below. |
+| `KAFKA_TOPIC_PREFIX` | `volcano.` | Prefix for derived topic names (used when `KAFKA_TOPIC` is unset) |
+| `KAFKA_TOPIC_INFIX` | `hl7.v2.` | Inserted between prefix and `{type}.{event}`; set `""` to suppress. Ignored when `KAFKA_TOPIC` is set. |
+| `KAFKA_MAX_REQUEST_SIZE` | `10485760` | Max record size (bytes). Keep ≥ topic `max.message.bytes`; Kafka's 1 MiB default NAKs document HL7. |
+| `KAFKA_BUFFER_MEMORY` | `67108864` | Producer buffer (bytes) |
+| `KAFKA_COMPRESSION_TYPE` | `lz4` | Producer compression |
 | `KAFKA_CLIENT_ID` | `volcano-hl7-mllp` | Kafka client identifier |
-| `KAFKA_ACK_TIMEOUT_MS` | `5000` | Kafka acknowledgment timeout |
+| `KAFKA_ACK_TIMEOUT_MS` | `5000` | Kafka acknowledgment timeout (also bounds `max.block.ms`) |
+| `METRICS_ENABLED` | `true` | Expose Prometheus `/metrics` + `/healthz` |
+| `METRICS_PORT` | `9404` | Metrics/health HTTP port |
 | `JAVA_OPTS` | `-Xmx512m -Xms256m` | JVM options |
 
-## Topic Naming & Routing Strategies
+## Topic Naming & Routing
 
-The connector supports two routing strategies controlled by the `KAFKA_TOPIC_NAME` environment variable:
+### Static topic (recommended): `KAFKA_TOPIC=…`
 
-### Legacy Mode (default: `KAFKA_TOPIC_NAME=legacy`)
+When `KAFKA_TOPIC` is set, every message from the instance is produced to that one topic. Topic identity comes from the **feed/deployment** (which you control), not the HL7 message type (which the upstream may change without notice). The message type and trigger event still travel in the Kafka headers and JSON payload, so consumers dispatch on metadata. This is the model for a one-connector-per-source-feed deployment.
 
-**Best for: HL7 v2.x (all versions including pre-v2.5)**
+- Example: `KAFKA_TOPIC=volcano.producer.hl7.v2.example.adt` → all ADT events for that feed land in `volcano.producer.hl7.v2.example.adt`.
+- Robust to drift: a new/unknown message type just lands in the same topic; nothing fails.
 
-Uses MSH-9.1 (message type) and MSH-9.2 (trigger event):
-- Topic format: `{prefix}hl7.v2.{type}.{event}`
+### Derived topic (fallback): MSH-9.1 + MSH-9.2
+
+Used only when `KAFKA_TOPIC` is unset. Topic = `{KAFKA_TOPIC_PREFIX}{KAFKA_TOPIC_INFIX}{type}.{event}`, lowercased.
 - Example: `volcano.hl7.v2.adt.a01`
-- Fallback: Uses "UNKNOWN" for missing fields (e.g., `volcano.hl7.v2.unknown.a01`)
-- Compatible with older HL7 messages that may not populate MSH-9.3
+- Both MSH-9.1 and MSH-9.2 are mandatory in every HL7 v2.x version, so this covers all senders.
+- Missing fields fall back to `UNKNOWN` (e.g. `volcano.hl7.v2.unknown.a01`).
 
-### Message Structure Mode (`KAFKA_TOPIC_NAME=message_structure`)
+## Observability
 
-**Best for: HL7 v2.5 and later**
+Prometheus metrics + health are served on `METRICS_PORT` (default `9404`):
+- `GET /metrics` — Prometheus text exposition
+- `GET /healthz` — liveness (process up)
 
-Uses MSH-9.3 (message structure):
-- Topic format: `{prefix}hl7.v2.{structure}`
-- Example: `volcano.hl7.v2.adt_a01`
-- Fallback: Uses "UNKNOWN" if MSH-9.3 is missing (e.g., `volcano.hl7.v2.unknown`)
-- More precise routing as MSH-9.3 explicitly defines the message structure
-- Note: MSH-9.3 is required in HL7 v2.5+ but optional in earlier versions
+Key metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processed_total{result}`, `hl7_kafka_produced_total{topic}`, `hl7_kafka_produce_failures_total{reason}`, `hl7_kafka_produce_duration_seconds`, `hl7_messages_in_flight`, plus JVM/process metrics. The MLLP TCP probe stays healthy during a Kafka outage by design (so the sender buffers), so **alert on `hl7_kafka_produce_failures_total`** rather than on pod health.
 
 ## JSON Output Format
 
@@ -169,10 +175,11 @@ Or view in Kafka UI at http://localhost:8080
 
 ## Dependencies
 
-- HAPI HL7 v2.3 - HL7 message parsing
-- Apache Kafka Clients 3.7.0 - Kafka integration
-- Gson 2.11.0 - JSON serialization
-- Logback 1.5.7 - Logging
+- HAPI 2.6.0 (`hapi-base` + `hapi-structures-v25`) - HL7 v2 parsing
+- Apache Kafka Clients 4.1.1 - Kafka integration
+- Gson 2.13.2 - JSON serialization
+- Prometheus simpleclient 0.16.0 - metrics
+- Logback 1.5.22 / SLF4J 2.0.17 - Logging
 
 ## License
 
