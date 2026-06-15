@@ -1,11 +1,22 @@
 # CI for the Volcano HL7 MLLP Connector.
 #
 # Pipeline:
-#   lint     — hadolint on the Dockerfile.
-#   test     — sbt compile + JSON conversion smoke test.
-#   build    — sbt assembly (uploads the fat JAR as a workflow artifact).
-#   container — buildx multi-stage image build + Trivy scan; pushes to
-#               ghcr.io/umessen/volcano-hl7-mllp on main pushes and tags.
+#   lint                  — hadolint on the Dockerfile.
+#   test                  — sbt test (MUnit suite) + JSON conversion smoke test.
+#   dependency-review     — (PRs) block dependencies with known CVEs / disallowed
+#                           licenses, using the GitHub Advisory Database.
+#   dependency-submission — (push to main) submit the sbt dependency graph to
+#                           GitHub so Dependabot security alerts cover the JVM
+#                           dependencies (sbt isn't natively parsed otherwise).
+#   build                 — sbt assembly (uploads the fat JAR).
+#   container             — image build, CycloneDX SBOM (Syft), Trivy scan with
+#                           SARIF upload to the Security tab; pushes to GHCR.
+#
+# Supply-chain hardening: every THIRD-PARTY action is pinned to a full commit
+# SHA (with a version comment), because tags are mutable and were the vector in
+# the March 2026 aquasecurity/trivy-action compromise. First-party actions/* and
+# docker/* stay on tags. Dependabot (.github/dependabot.yml) bumps both the SHAs
+# and the version comments weekly.
 name: CI
 
 on:
@@ -40,13 +51,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Hadolint
-        uses: hadolint/hadolint-action@v3.3.0
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
           dockerfile: Dockerfile
           failure-threshold: warning
 
   test:
-    name: Compile + smoke test
+    name: Test
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -71,11 +82,42 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-sbt-
 
-      - name: Compile (main + test)
-        run: sbt -batch "Test/compile"
+      - name: Run tests (MUnit)
+        run: sbt -batch test
 
       - name: JSON conversion smoke test
         run: sbt -batch "Test/runMain volcano.hl7mllp.JsonConversionTest"
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Dependency review (GitHub Advisory DB)
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  dependency-submission:
+    name: Submit dependency graph
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # the Dependency Submission API writes a snapshot
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: sbt/setup-sbt@v1
+      - name: Submit sbt dependency graph
+        uses: scalacenter/sbt-dependency-submission@64084844d2b0a9b6c3765f33acde2fbe3f5ae7d3 # v3.1.0
 
   build:
     name: Build fat JAR
@@ -127,7 +169,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write   # for cosign / OIDC if added later
+      security-events: write   # upload the Trivy SARIF to the Security tab
+      id-token: write          # for cosign / OIDC if added later
     steps:
       - uses: actions/checkout@v6
 
@@ -161,7 +204,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build once, load into the local docker daemon for Trivy to scan.
+      # Build once, load into the local docker daemon for SBOM + scan.
       - name: Build (load only)
         uses: docker/build-push-action@v7
         with:
@@ -171,8 +214,37 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@v0.36.0
+      # CycloneDX SBOM of the final image (OS packages + JVM libraries).
+      - name: Generate SBOM (Syft, CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: scan-target:ci
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          artifact-name: volcano-hl7-mllp-sbom.cdx.json
+
+      # Scan → SARIF (always uploaded so findings land in the Security tab even
+      # when the gate below fails).
+      - name: Trivy scan (SARIF)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan-target:ci
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image
+
+      # Gate: fail the job (and block the push below) on unfixed-excluded HIGH/CRITICAL.
+      - name: Trivy gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scan-target:ci
           format: table
