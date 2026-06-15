@@ -25,6 +25,23 @@ object KafkaProducerFactory:
     props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, Integer.valueOf(5000))
     props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.valueOf(Math.max(cfg.kafkaAcksTimeoutMs, 10000)))
 
+    // Message sizing: the Kafka client default max.request.size is 1 MiB and
+    // is checked client-side before the record ever reaches the broker. HL7
+    // document feeds (MDM, ORU with embedded PDFs/images) plus the JSON
+    // envelope's ~2-3x inflation blow past that and would NAK forever. Match
+    // the topic's max.message.bytes and give the buffer room for a few
+    // in-flight large records. Compression shrinks the verbose JSON on the
+    // wire and on disk.
+    props.put(ProducerConfig.MAX_REQUEST_SIZE_CONFIG, Integer.valueOf(cfg.kafkaMaxRequestSize))
+    props.put(ProducerConfig.BUFFER_MEMORY_CONFIG, java.lang.Long.valueOf(cfg.kafkaBufferMemory))
+    props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, cfg.kafkaCompressionType)
+
+    // Bound how long send() can block on metadata/buffer. Default is 60s,
+    // which on a Kafka outage stalls the (serial) MLLP processing thread well
+    // past our own ack timeout and makes the ACK/NAK non-deterministic. Cap it
+    // to the ack budget so failures stay fast and predictable.
+    props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, java.lang.Long.valueOf(cfg.kafkaAcksTimeoutMs.toLong))
+
     configureSecurityProtocol(props, cfg)
     configureSasl(props, cfg)
     configureSsl(props, cfg)

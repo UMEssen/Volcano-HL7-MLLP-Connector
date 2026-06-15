@@ -41,15 +41,24 @@ services:
     container_name: volcano-hl7-mllp
     ports:
       - "2575:2575"
+      - "9404:9404"   # Prometheus metrics / health
     environment:
       MLLP_PORT: 2575
       MLLP_TLS: "false"
       HL7_ENCODING: UTF-8
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
+      # Static topic: set KAFKA_TOPIC to route every message from this
+      # instance to one fixed topic (the feed-based model). Leave empty to
+      # derive {KAFKA_TOPIC_PREFIX}{KAFKA_TOPIC_INFIX}{type}.{event} from MSH-9.
+      KAFKA_TOPIC: ""
       KAFKA_TOPIC_PREFIX: volcano.
-      KAFKA_TOPIC_NAME: legacy  # Options: legacy (MSH-9.1.MSH-9.2, HL7 v2.x) | message_structure (MSH-9.3, HL7 v2.5+)
+      KAFKA_TOPIC_INFIX: hl7.v2.
       KAFKA_CLIENT_ID: volcano-hl7-mllp
       KAFKA_ACK_TIMEOUT_MS: 5000
+      KAFKA_MAX_REQUEST_SIZE: 10485760
+      KAFKA_COMPRESSION_TYPE: lz4
+      METRICS_ENABLED: "true"
+      METRICS_PORT: 9404
       # SASL Authentication (uncomment and configure for secured Kafka)
       KAFKA_SASL_ENABLED: "false"
       KAFKA_SASL_MECHANISM: SCRAM-SHA-512

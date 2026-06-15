@@ -13,7 +13,14 @@ lazy val root = (project in file("."))
       "org.apache.kafka" % "kafka-clients" % "4.1.1",
       "org.slf4j" % "slf4j-api" % "2.0.17",
       "ch.qos.logback" % "logback-classic" % "1.5.22",
-      "com.google.code.gson" % "gson" % "2.13.2"
+      "com.google.code.gson" % "gson" % "2.13.2",
+      // Prometheus metrics + text exporter (HTTP server is the JDK's
+      // com.sun.net.httpserver, no extra dep). hotspot = JVM/process metrics.
+      "io.prometheus" % "simpleclient" % "0.16.0",
+      "io.prometheus" % "simpleclient_common" % "0.16.0",
+      "io.prometheus" % "simpleclient_hotspot" % "0.16.0",
+      // Test framework.
+      "org.scalameta" %% "munit" % "1.0.0" % Test
     ),
     assembly / assemblyMergeStrategy := {
       case PathList("META-INF", "services", xs @ _*) => MergeStrategy.concat

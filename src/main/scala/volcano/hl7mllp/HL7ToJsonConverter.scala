@@ -3,21 +3,31 @@ package volcano.hl7mllp
 import ca.uhn.hl7v2.model.{Message, Segment}
 import ca.uhn.hl7v2.parser.PipeParser
 import ca.uhn.hl7v2.util.Terser
-import com.google.gson.{Gson, GsonBuilder, JsonObject, JsonArray}
+import com.google.gson.{Gson, JsonObject, JsonArray}
 
 object HL7ToJsonConverter:
 
-  def convert(msg: Message, pipeParser: PipeParser): String =
-    val gson = new GsonBuilder().setPrettyPrinting().create()
+  // Bump when the envelope shape changes. Emitted both in the JSON body and as
+  // the `schema_version` Kafka header so consumers can branch without guessing.
+  val SchemaVersion: String = "1.0"
+
+  // Compact (not pretty-printed) and a single shared instance: this is a
+  // machine-to-machine pipeline, so the whitespace was pure payload bloat —
+  // it inflated every record and pushed document messages past size limits.
+  // Gson is thread-safe for reuse.
+  private val gson = new Gson()
+
+  def convert(msg: Message, pipeParser: PipeParser, includeRaw: Boolean = true): String =
     val json = new JsonObject()
 
-    // Add the raw HL7 message as ER7 (pipe-delimited) format
-    json.addProperty("hl7_raw", pipeParser.encode(msg))
+    json.addProperty("schema_version", SchemaVersion)
 
-    // Add message metadata
+    // The raw ER7 (pipe-delimited) form. Optional: it roughly doubles the
+    // envelope, so consumers that only need the parsed view can drop it.
+    if includeRaw then
+      json.addProperty("hl7_raw", pipeParser.encode(msg))
+
     json.add("metadata", extractMetadata(msg))
-
-    // Add all segments as structured data
     json.add("segments", extractSegments(msg))
 
     gson.toJson(json)
