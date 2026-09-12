@@ -1,21 +1,39 @@
 package volcano.hl7mllp
 
-import ca.uhn.hl7v2.model.{Message, Segment}
-import ca.uhn.hl7v2.parser.PipeParser
+import ca.uhn.hl7v2.model.{Message, Primitive, Segment, Type, Varies}
+import ca.uhn.hl7v2.parser.{EncodingCharacters, PipeParser}
 import ca.uhn.hl7v2.util.Terser
 import com.google.gson.{Gson, JsonObject, JsonArray}
 
+import scala.util.Try
+
 object HL7ToJsonConverter:
 
-  // Bump when the envelope shape changes. Emitted both in the JSON body and as
-  // the `schema_version` Kafka header so consumers can branch without guessing.
-  val SchemaVersion: String = "1.0"
+  // Bump when the envelope shape or the meaning of its values changes. Emitted
+  // both in the JSON body and as the `schema_version` Kafka header so consumers
+  // can branch without guessing.
+  //   1.0 — initial shape.
+  //   1.1 — segments[].fields[].value is the field's ER7 encoding. Before 1.1
+  //         it was Type.toString(), which is HAPI's debug rendering and wrapped
+  //         every non-primitive field in its datatype class name
+  //         ("HD[SENDING_APP]", "MSG[ADT^A01]", "Varies[...]").
+  val SchemaVersion: String = "1.1"
 
   // Compact (not pretty-printed) and a single shared instance: this is a
   // machine-to-machine pipeline, so the whitespace was pure payload bloat —
   // it inflated every record and pushed document messages past size limits.
   // Gson is thread-safe for reuse.
   private val gson = new Gson()
+
+  // MSH-1/MSH-2 (and their batch-header equivalents) *define* the delimiters,
+  // so they hold raw delimiter characters rather than data. Re-encoding them
+  // would escape the very characters they declare ("|" -> "\F\",
+  // "^~\&" -> "\S\\R\\E\\T\"), which is both wrong and unparseable. They are
+  // emitted verbatim, exactly as they appear in the ER7.
+  private val DelimiterSegments = Set("MSH", "FHS", "BHS")
+
+  private def isDelimiterField(segmentName: String, fieldNum: Int): Boolean =
+    (fieldNum == 1 || fieldNum == 2) && DelimiterSegments.contains(segmentName)
 
   def convert(msg: Message, pipeParser: PipeParser, includeRaw: Boolean = true): String =
     val json = new JsonObject()
@@ -28,9 +46,15 @@ object HL7ToJsonConverter:
       json.addProperty("hl7_raw", pipeParser.encode(msg))
 
     json.add("metadata", extractMetadata(msg))
-    json.add("segments", extractSegments(msg))
+    json.add("segments", extractSegments(msg, encodingCharsOf(msg)))
 
     gson.toJson(json)
+
+  // The message's own delimiters (MSH-2), so a sender using non-standard
+  // encoding characters round-trips. Falls back to the HL7 defaults if MSH-2
+  // is unreadable — which is what HAPI's own debug rendering always used.
+  private def encodingCharsOf(msg: Message): EncodingCharacters =
+    Try(EncodingCharacters.getInstance(msg)).getOrElse(EncodingCharacters.defaultInstance())
 
   private def extractMetadata(msg: Message): JsonObject =
     val terser = new Terser(msg)
@@ -47,7 +71,7 @@ object HL7ToJsonConverter:
     metadata.addProperty("version", Option(terser.get("/MSH-12")).getOrElse(""))
     metadata
 
-  private def extractSegments(msg: Message): JsonArray =
+  private def extractSegments(msg: Message, encodingChars: EncodingCharacters): JsonArray =
     val segments = new JsonArray()
     val names = msg.getNames()
 
@@ -57,20 +81,20 @@ object HL7ToJsonConverter:
       for (structure <- structures) {
         structure match {
           case seg: Segment =>
-            segments.add(extractSegment(name, seg))
+            segments.add(extractSegment(name, seg, encodingChars))
           case _ => // Skip non-segment structures
         }
       }
     }
     segments
 
-  private def extractSegment(name: String, seg: Segment): JsonObject =
+  private def extractSegment(name: String, seg: Segment, encodingChars: EncodingCharacters): JsonObject =
     val segmentObj = new JsonObject()
     segmentObj.addProperty("segment_name", name)
-    segmentObj.add("fields", extractFields(seg))
+    segmentObj.add("fields", extractFields(name, seg, encodingChars))
     segmentObj
 
-  private def extractFields(seg: Segment): JsonArray =
+  private def extractFields(segmentName: String, seg: Segment, encodingChars: EncodingCharacters): JsonArray =
     val fields = new JsonArray()
 
     for (fieldNum <- 1 to seg.numFields()) {
@@ -80,7 +104,7 @@ object HL7ToJsonConverter:
           for (rep <- 0 until field.length) {
             val fieldValue = field(rep)
             if (fieldValue != null) {
-              val fieldStr = fieldValue.toString
+              val fieldStr = encodeField(segmentName, fieldNum, fieldValue, encodingChars)
               if (fieldStr != null && fieldStr.nonEmpty) {
                 val fieldObj = new JsonObject()
                 fieldObj.addProperty("field", fieldNum)
@@ -96,3 +120,32 @@ object HL7ToJsonConverter:
       }
     }
     fields
+
+  // Render one field repetition as its ER7 encoding — the exact substring the
+  // field occupies in `hl7_raw`: components joined with "^", subcomponents with
+  // "&", delimiters inside data escaped ("\F\", "\S\", ...).
+  //
+  // NOT Type.toString(): HAPI documents that as a debug rendering and it
+  // returns "<DatatypeClassName>[<encoded value>]" for every non-primitive
+  // (AbstractType.toString, hapi-base 2.6.0), which is where the "HD[...]",
+  // "MSG[...]" and "Varies[...]" wrappers in the envelope came from.
+  private def encodeField(
+      segmentName: String,
+      fieldNum: Int,
+      fieldValue: Type,
+      encodingChars: EncodingCharacters
+  ): String =
+    fieldValue match
+      // Delimiter definitions are stored as the literal delimiter characters
+      // and must not be escaped back into the data they declare.
+      case p: Primitive if isDelimiterField(segmentName, fieldNum) =>
+        Option(p.getValue).getOrElse("")
+      case _ =>
+        // Fields HAPI cannot type statically (OBX-5, Z-segments) arrive as a
+        // Varies wrapping the concrete Type. PipeParser.encode unwraps Varies
+        // itself; doing it here too is defence in depth, and keeps the
+        // behaviour explicit rather than relying on a library internal.
+        val resolved = fieldValue match
+          case v: Varies if v.getData != null => v.getData
+          case other                          => other
+        PipeParser.encode(resolved, encodingChars)

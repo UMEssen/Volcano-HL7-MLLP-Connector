@@ -50,6 +50,7 @@ docker-compose up    # Containerized with Kafka
 Key environment variables (see `.env.example` or `docker-compose.yml`):
 - `MLLP_PORT` - Port to listen on (default: 2575)
 - `MLLP_TLS` - Enable TLS (default: false)
+- `MLLP_MAX_FRAME_BYTES` - Hard cap on one inbound MLLP frame, enforced at the wire before parsing (default: `KAFKA_MAX_REQUEST_SIZE`). `0` disables it.
 - `HL7_ENCODING` - Character encoding for HL7 messages (default: UTF-8). Supports UTF-8, ISO-8859-1, windows-1252, US-ASCII. **MSH-18 (declared charset) is ignored** — match this to what the sender emits.
 - `HL7_INCLUDE_RAW` - Include the raw ER7 string in the JSON envelope (default: true)
 - `KAFKA_BOOTSTRAP_SERVERS` - Kafka broker addresses
@@ -59,6 +60,9 @@ Key environment variables (see `.env.example` or `docker-compose.yml`):
 - `KAFKA_MAX_REQUEST_SIZE` - Client-side max record size in bytes (default: 10485760 / 10 MiB). Must be ≥ the topic's `max.message.bytes`; the Kafka default of 1 MiB silently NAKs document-bearing HL7.
 - `KAFKA_BUFFER_MEMORY` - Producer buffer in bytes (default: 67108864 / 64 MiB)
 - `KAFKA_COMPRESSION_TYPE` - Producer compression (default: lz4)
+- `KAFKA_ACK_TIMEOUT_MS` - Bounds `max.block.ms`: how long a Kafka outage may block `send()` itself (default: 5000). **Not** the whole ACK budget — see below.
+- `KAFKA_REQUEST_TIMEOUT_MS` - `request.timeout.ms`, one broker round trip (default: 5000)
+- `KAFKA_DELIVERY_TIMEOUT_MS` - `delivery.timeout.ms`, the producer's total retry budget per record, and the floor for the app-level ACK wait (default: 10000). Lower this to NAK faster.
 - `METRICS_ENABLED` - Expose Prometheus metrics + health (default: true)
 - `METRICS_PORT` - Port for `/metrics` and `/healthz` (default: 9404)
 - `KAFKA_SASL_ENABLED` - Enable SASL authentication (default: false)
@@ -77,7 +81,8 @@ The connector is split into focused single-responsibility files under `src/main/
 - `Config.scala` — environment-variable configuration (`Config.load()`).
 - `KafkaProducerFactory.scala` — builds the producer (reliability, sizing, SASL/SSL).
 - `HL7MessageProcessor.scala` — topic resolution (static vs derived), partition key, Kafka headers.
-- `HL7ToJsonConverter.scala` — HAPI message → JSON envelope (compact, `schema_version`).
+- `HL7ToJsonConverter.scala` — HAPI message → JSON envelope (compact, `schema_version`). Field values are the field's **ER7 encoding** (`PipeParser.encode`), never `Type.toString()` — that is HAPI's debug rendering and wraps non-primitives in their datatype class name (`HD[...]`, `MSG[...]`, `Varies[...]`). `MSH-1`/`MSH-2` are emitted verbatim; escaping the delimiters they declare would be circular.
+- `MllpFrameLimit.scala` — inbound MLLP frame-size cap (`FrameLimitingInputStream`, `BoundedMinLowerLayerProtocol`).
 - `HL7AckGenerator.scala` — AA/AE acknowledgments.
 - `Metrics.scala` — Prometheus registry + embedded `/metrics` and `/healthz` HTTP server.
 
@@ -124,11 +129,14 @@ Uses MSH-10 (message control ID) as the Kafka partition key. **Deliberately not 
 ### Reliability Design
 - **Kafka Producer Config**: `acks=all`, idempotence enabled, max retries, 5 in-flight requests
 - **Message sizing**: `max.request.size`/`buffer.memory` raised above the 1 MiB client default (document feeds), `compression.type=lz4`, `max.block.ms` bounded to the ack timeout so a Kafka outage fails fast instead of stalling the serial MLLP thread
-- **Synchronous Send**: Waits for Kafka confirmation before ACKing to sender (timeout = `KAFKA_ACK_TIMEOUT_MS`); on any failure returns AE so the upstream sender buffers and retries — durability is intentionally pushed back to the sender
+- **Synchronous Send**: Waits for Kafka confirmation before ACKing to sender; on any failure returns AE so the upstream sender buffers and retries — durability is intentionally pushed back to the sender
+- **Timeout chain** (`Config.kafkaAckWaitMs`, `Config.validateTimeouts`): the wait on the send future is derived as `max(KAFKA_ACK_TIMEOUT_MS, KAFKA_DELIVERY_TIMEOUT_MS)` and can never be shorter than `delivery.timeout.ms`. `Future.get(timeout)` does not cancel the send, so a shorter wait would return an AE for a record the producer is still retrying and may still land; `delivery < request` is refused at startup
+- **Inbound frame cap** (`MLLP_MAX_FRAME_BYTES`, `BoundedMinLowerLayerProtocol`): one MLLP frame is bounded at the wire before HAPI buffers or parses it. Rejections increment `hl7_mllp_frames_rejected_total{reason}`; there is no AE for an oversized frame (HAPI tears the connection down without reaching the responder, and there is no parsed message to acknowledge)
+- **Remaining duplicate window**: an ACK lost *after* a durable produce makes the sender resend the identical message. Same MSH-10 → same key → same partition, but the topics are not compacted, so consumers must be idempotent. An AE proves the connector could not confirm the write, not that nothing reached Kafka
 - **Graceful Shutdown**: Flushes and closes producer, stops MLLP server + metrics server cleanly
 
 ### Observability (Metrics)
-`Metrics.scala` runs a Prometheus exporter on `METRICS_PORT` (default 9404): `/metrics` (text format) and `/healthz`. App metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processed_total{result=ack|nak}`, `hl7_kafka_produced_total{topic}`, `hl7_kafka_produce_failures_total{reason=timeout|record_too_large|hl7_parse|other}`, `hl7_kafka_produce_duration_seconds` (histogram), `hl7_messages_in_flight`, plus JVM/process metrics.
+`Metrics.scala` runs a Prometheus exporter on `METRICS_PORT` (default 9404): `/metrics` (text format) and `/healthz`. App metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processed_total{result=ack|nak}`, `hl7_kafka_produced_total{topic}`, `hl7_kafka_produce_failures_total{reason=timeout|record_too_large|hl7_parse|other}`, `hl7_kafka_produce_duration_seconds` (histogram), `hl7_messages_in_flight`, `hl7_mllp_frames_rejected_total{reason=oversize}`, plus JVM/process metrics.
 
 **`/healthz` = MLLP-listener liveness, NOT Kafka.** It returns 200 only while the HAPI `HL7Service` `isRunning()` (wired via an `AtomicReference` set in `Main`), 503 otherwise — so the k8s probes restart/drain a pod whose listener died, but a **Kafka outage keeps it green** (the connector must keep accepting and NAK so the sender buffers/retries). Pipeline (Kafka) health is therefore only visible via `hl7_kafka_produce_failures_total` — alert on that, not on pod health.
 
@@ -222,7 +230,7 @@ Single naming scheme — see the "Topic Naming" section above for the full refer
 - Missing fields → `UNKNOWN` (e.g. `volcano.hl7.v2.unknown.a01`).
 
 ### Error Handling
-- Kafka timeouts (>5s) return HL7 AE acknowledgment with "Kafka timeout" error text
+- Kafka timeouts return HL7 AE acknowledgment with "Kafka timeout" error text (the deadline is `Config.kafkaAckWaitMs`, not `KAFKA_ACK_TIMEOUT_MS` directly)
 - Other Kafka failures return AE with exception message (truncated to 200 chars, escaped)
 - HL7 parsing errors would prevent message processing (handled by HAPI framework)
 
@@ -247,6 +255,9 @@ This strategy ensures SLF4J 2.x can discover the Logback implementation via Serv
 ## Testing Considerations
 
 - **`RoutingSuite.scala`** — MUnit unit tests for topic resolution (static/derived), partition key + fallback, Kafka headers, and the JSON envelope. Run with `sbt test`.
+- **`EnvelopeEncodingSuite.scala`** — pins the envelope's field-value contract: ER7 encoding, no datatype-class wrappers, delimiter fields verbatim, values match `hl7_raw`.
+- **`ConfigTimeoutSuite.scala`** — the producer timeout chain (ack wait >= delivery >= request) and its startup validation.
+- **`MllpFrameLimitSuite.scala`** — the inbound frame cap: per-frame budget, bounded buffering, synthetic oversized frame.
 - **`JsonConversionTest.scala`** — a `runMain` smoke test that parses a sample message and prints/asserts the JSON envelope. Run with `sbt "Test/runMain volcano.hl7mllp.JsonConversionTest"`.
 
 CI (`.github/workflows/ci.yml`) runs both, plus: hadolint, a CycloneDX **SBOM** (Syft) of the image, **Trivy** scan with SARIF upload to the Security tab, sbt **dependency-graph submission** (feeds Dependabot/GitHub Advisory alerts), and **dependency-review** on PRs. Third-party actions are pinned to commit SHAs (Dependabot bumps them).

@@ -37,7 +37,18 @@ object JsonConversionTest:
     println("=" * 80)
     println(json)
     println("=" * 80)
-    require(json.contains("\"schema_version\":\"1.0\""), "envelope must carry schema_version")
+    require(
+      json.contains(s"\"schema_version\":\"${HL7ToJsonConverter.SchemaVersion}\""),
+      "envelope must carry schema_version"
+    )
+    // Field values are ER7-encoded, never HAPI's "Datatype[value]" debug form.
+    require(json.contains("\"value\":\"SENDING_APP\""), "MSH-3 must be the encoded value, not HD[...]")
+    require(json.contains("\"value\":\"ADT^A01^ADT_A01\""), "MSH-9 must be the encoded value, not MSG[...]")
+    val wrapped = """"value":"[A-Za-z][A-Za-z0-9_]*\[""".r
+    require(
+      wrapped.findFirstIn(json).isEmpty,
+      s"no field value may carry a datatype-class wrapper: ${wrapped.findFirstIn(json)}"
+    )
     require(json.contains("\"hl7_raw\""), "default convert should include hl7_raw")
     require(!json.contains("\n  "), "envelope must be compact (no pretty-printing)")
 
