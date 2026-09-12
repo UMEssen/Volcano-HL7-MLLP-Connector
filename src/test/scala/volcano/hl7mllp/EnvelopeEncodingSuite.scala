@@ -1,6 +1,7 @@
 package volcano.hl7mllp
 
 import ca.uhn.hl7v2.DefaultHapiContext
+import ca.uhn.hl7v2.model.Segment
 import com.google.gson.JsonParser
 
 import scala.jdk.CollectionConverters.*
@@ -83,7 +84,13 @@ class EnvelopeEncodingSuite extends munit.FunSuite:
 
   test("delimiters inside data stay escaped, exactly as in hl7_raw") {
     val f = envelope(escapedSample)
-    // Primitive field: HAPI unescapes into the model, the envelope re-encodes.
+    // Primitive field. This one genuinely changed with schema_version 1.1:
+    // AbstractPrimitive.toString returns getValue() (hapi-base 2.6.0), i.e. the
+    // *decoded* character, so the old envelope carried a bare separator inside
+    // a single-component value. Re-encoding restores the escape and matches
+    // hl7_raw. Note that only primitives behaved this way — AbstractType's
+    // toString wraps everything else, so composites never showed the decoded
+    // form. The test below pins both halves of that.
     assertEquals(f(("OBX", 7, 0)), "re\\F\\f")
     // Composite: the escape sequence is carried through untouched.
     assertEquals(f(("OBX", 3, 0)), "CODE^La\\S\\bel^L")
@@ -94,6 +101,20 @@ class EnvelopeEncodingSuite extends munit.FunSuite:
     envelope(sample).foreach { case ((seg, num, rep), value) =>
       assert(raw.contains(value), s"$seg-$num rep=$rep value [$value] is not a substring of hl7_raw")
     }
+  }
+
+  test("HAPI's Type.toString is the debug form this converter must not use") {
+    // Evidence for the 1.0 -> 1.1 delta, and a tripwire: if HAPI ever changes
+    // either rendering, the reasoning behind encodeField needs re-reading.
+    parser.parse(sample).get("MSH") match
+      case seg: Segment =>
+        // Non-primitive: AbstractType.toString wraps in the datatype class name.
+        assertEquals(seg.getField(3, 0).toString, "HD[SENDING_APP]")
+        assertEquals(seg.getField(9, 0).toString, "MSG[ADT^A01^ADT_A01]")
+        // Primitive: AbstractPrimitive.toString returns the decoded value, unwrapped.
+        assertEquals(seg.getField(10, 0).toString, "MSG00001")
+        assertEquals(seg.getField(1, 0).toString, "|")
+      case other => fail(s"MSH is not a Segment but ${other.getClass.getName}")
   }
 
   test("schema_version advertises the field-value contract") {

@@ -10,7 +10,7 @@ import ca.uhn.hl7v2.llp.MinLowerLayerProtocol
 import ca.uhn.hl7v2.util.Terser
 import ca.uhn.hl7v2.HL7Exception
 import org.apache.kafka.clients.producer.{ProducerRecord, RecordMetadata}
-import org.apache.kafka.common.errors.RecordTooLargeException
+import org.apache.kafka.common.errors.{RecordTooLargeException, TimeoutException as KafkaTimeoutException}
 import org.slf4j.LoggerFactory
 
 import java.util.concurrent.{ExecutionException, TimeoutException, TimeUnit}
@@ -21,8 +21,19 @@ object Main:
   private val log = LoggerFactory.getLogger(getClass)
 
   // Map a thrown failure to a stable, low-cardinality metric reason + log tag.
-  private def classify(e: Throwable): String = e match
+  //
+  // There are TWO unrelated TimeoutException classes on this path and both mean
+  // "timeout" to an operator: java.util.concurrent's, thrown by Future.get when
+  // the app-level wait expires, and org.apache.kafka.common.errors', thrown
+  // synchronously by send() when max.block.ms expires and wrapped in an
+  // ExecutionException when delivery.timeout.ms expires (it extends
+  // RetriableException, not the java.util.concurrent one). Matching only the
+  // first leaves hl7_kafka_produce_failures_total{reason="timeout"} at zero
+  // through a Kafka outage — the exact series the README tells operators to
+  // alert on.
+  private[hl7mllp] def classify(e: Throwable): String = e match
     case _: TimeoutException          => "timeout"
+    case _: KafkaTimeoutException     => "timeout"
     case _: RecordTooLargeException   => "record_too_large"
     case _: HL7Exception              => "hl7_parse"
     case ee: ExecutionException if ee.getCause != null => classify(ee.getCause)
@@ -42,13 +53,11 @@ object Main:
           s"delivery.timeout.ms=${cfg.kafkaDeliveryTimeoutMs}, max.block.ms=${cfg.kafkaAcksTimeoutMs}, " +
           s"app ACK wait=${cfg.kafkaAckWaitMs}ms"
       )
-      if cfg.ackWaitWasRaised then
-        log.warn(
-          s"KAFKA_ACK_TIMEOUT_MS=${cfg.kafkaAcksTimeoutMs}ms is below delivery.timeout.ms=" +
-            s"${cfg.kafkaDeliveryTimeoutMs}ms, so the ACK wait is raised to ${cfg.kafkaAckWaitMs}ms: " +
-            "the handler must not NAK a record the producer is still retrying, or the sender " +
-            "resends one that lands anyway. Lower KAFKA_DELIVERY_TIMEOUT_MS to fail faster."
-        )
+      log.info(
+        "The ACK wait is derived to trail delivery.timeout.ms, so the producer always gives up " +
+          "first and an AE is never returned for a record that can still land. Lower " +
+          "KAFKA_DELIVERY_TIMEOUT_MS to fail faster."
+      )
 
       // /healthz reads MLLP-listener liveness through this ref: false until the
       // HL7Service is created and started, true while it runs, false once it
@@ -75,7 +84,17 @@ object Main:
             )
           BoundedMinLowerLayerProtocol(
             cfg.mllpMaxFrameBytes,
-            () => Metrics.framesRejected.labels("oversize").inc()
+            () =>
+              Metrics.framesRejected.labels("oversize").inc()
+              // HAPI logs the connection teardown itself (Receiver.handle, at
+              // WARN, with the peer address), but not the knob. Say which
+              // setting refused it, so "this feed stopped ingesting" does not
+              // have to be diagnosed from a counter.
+              log.warn(
+                s"Refused an inbound MLLP frame larger than ${cfg.mllpMaxFrameBytes} bytes " +
+                  "(MLLP_MAX_FRAME_BYTES); the connection is dropped without an AE and the sender " +
+                  "will retry the same frame, so this repeats until the sender or the cap changes"
+              )
           )
         else
           log.warn(
@@ -144,7 +163,8 @@ object Main:
               Metrics.produceFailures.labels(reason).inc()
               Metrics.processed.labels("nak").inc()
               val errorMsg = reason match
-                case "timeout"          => s"Kafka timeout (>${cfg.kafkaAckWaitMs}ms)"
+                case "timeout"          =>
+                  s"Kafka timeout (delivery budget ${cfg.kafkaDeliveryTimeoutMs}ms, ACK wait ${cfg.kafkaAckWaitMs}ms)"
                 case "record_too_large" => "Message exceeds Kafka max.request.size — raise KAFKA_MAX_REQUEST_SIZE and the topic's max.message.bytes"
                 case "hl7_parse"        => s"HL7 parsing error: ${Option(e.getMessage).getOrElse("Invalid message format")}"
                 case _                  => s"Processing error: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"

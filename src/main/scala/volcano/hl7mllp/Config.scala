@@ -63,12 +63,21 @@ final case class Config(
    * To fail faster, lower KAFKA_DELIVERY_TIMEOUT_MS; that shrinks the whole
    * chain instead of only the half the sender can see.
    */
-  def kafkaAckWaitMs: Int = math.max(kafkaAcksTimeoutMs, kafkaDeliveryTimeoutMs)
-
-  /** True when kafkaAckWaitMs had to be raised above the configured ack timeout. */
-  def ackWaitWasRaised: Boolean = kafkaAckWaitMs > kafkaAcksTimeoutMs
+  def kafkaAckWaitMs: Int = math.max(kafkaAcksTimeoutMs, kafkaDeliveryTimeoutMs + Config.AckWaitMarginMs)
 
 object Config:
+  /**
+   * How far the app-level wait is placed beyond delivery.timeout.ms.
+   *
+   * Equality is not enough. The two clocks start almost together — the delivery
+   * budget when send() appends the record, the app wait when send() returns —
+   * but the producer only expires a batch on its next sender-loop pass, so an
+   * equal deadline can still fire on the app side first and reintroduce exactly
+   * the premature NAK this is meant to prevent. The margin makes the ordering
+   * unconditional: the app-level wait is a backstop against a stuck producer
+   * thread and should never be the deadline that actually fires.
+   */
+  val AckWaitMarginMs: Int          = 2000
   val DefaultRequestTimeoutMs: Int  = 5000
   val DefaultDeliveryTimeoutMs: Int = 10000
   val DefaultMaxRequestSize: Int    = 10485760 // 10 MiB

@@ -86,7 +86,7 @@ Configure via environment variables:
 | `KAFKA_CLIENT_ID` | `volcano-hl7-mllp` | Kafka client identifier |
 | `KAFKA_ACK_TIMEOUT_MS` | `5000` | How long a Kafka outage may block `send()` itself; sets `max.block.ms`. Raised to `KAFKA_DELIVERY_TIMEOUT_MS` for the ACK wait — see [Delivery semantics](#delivery-semantics). |
 | `KAFKA_REQUEST_TIMEOUT_MS` | `5000` | `request.timeout.ms` — one broker round trip |
-| `KAFKA_DELIVERY_TIMEOUT_MS` | `10000` | `delivery.timeout.ms` — the producer's total retry budget per record, and the floor for the ACK wait. **Lower this to make the connector NAK faster.** |
+| `KAFKA_DELIVERY_TIMEOUT_MS` | `10000` | `delivery.timeout.ms` — the producer's total retry budget per record. The ACK wait is derived as this plus a 2s margin. **Lower this to make the connector NAK faster.** |
 | `METRICS_ENABLED` | `true` | Expose Prometheus `/metrics` + `/healthz` |
 | `METRICS_PORT` | `9404` | Metrics/health HTTP port |
 | `JAVA_OPTS` | `-Xmx512m -Xms256m` | JVM options |
@@ -165,6 +165,15 @@ consumer can branch without guessing.
 | `1.0` | Initial shape. `segments[].fields[].value` was HAPI's `Type.toString()`, which is a *debug* rendering: every non-primitive field arrived wrapped in its datatype class name — `HD[SENDING_APP]`, `MSG[ADT^A01^ADT_A01]`, `Varies[...]`. |
 | `1.1` | `segments[].fields[].value` is the field's ER7 encoding (above). No shape change; the wrappers are gone, and a primitive containing an escaped delimiter now keeps the escape rather than the decoded character. |
 
+The primitive case is the one delta that is not just wrapper removal, and it is
+worth being precise about: `AbstractPrimitive.toString()` returns `getValue()`,
+the *decoded* value, so a primitive whose wire form was `re\F\f` used to appear
+as `re|f` — a bare field separator inside a single-component value, and `a\S\b`
+used to appear as `a^b`, which any consumer splitting on `^` reads as two
+components. Only primitives behaved that way; `AbstractType.toString()` wraps
+everything else and preserves the escapes inside the wrapper, so composites see
+wrapper removal and nothing more.
+
 Consumers that strip the `1.0` wrappers must keep doing so for as long as they
 may replay archived `1.0` records.
 
@@ -186,20 +195,25 @@ Four values have to nest, and the connector enforces that rather than leaving it
 to whoever edits the environment:
 
 ```
-app ACK wait  >=  delivery.timeout.ms  >=  request.timeout.ms  (+ linger.ms, 0 here)
+app ACK wait  >   delivery.timeout.ms  >=  request.timeout.ms  (+ linger.ms, 0 here)
 (derived)         KAFKA_DELIVERY_TIMEOUT_MS   KAFKA_REQUEST_TIMEOUT_MS
 
 max.block.ms  =   KAFKA_ACK_TIMEOUT_MS        (how long an outage may block send() itself)
 ```
 
 * The wait on the send future is **derived**: `max(KAFKA_ACK_TIMEOUT_MS,
-  KAFKA_DELIVERY_TIMEOUT_MS)`. `Future.get(timeout, unit)` does **not** cancel
-  the underlying send — the producer keeps retrying for its full delivery
+  KAFKA_DELIVERY_TIMEOUT_MS + 2000)`. `Future.get(timeout, unit)` does **not**
+  cancel the underlying send — the producer keeps retrying for its full delivery
   budget — so an app-level wait shorter than `delivery.timeout.ms` returns an
   `AE` for a record that is still in flight and can still be accepted. The
   sender then resends, and the pipeline gets two copies of a message it was told
-  had failed. Deriving the wait removes that window by construction; when it has
-  to raise the configured value, it logs a warning at startup saying so.
+  had failed. Deriving the wait removes that window by construction.
+* The wait **trails** the delivery budget rather than equalling it. Both clocks
+  start almost together (the delivery budget when `send()` appends the record,
+  the app wait when `send()` returns), but the producer only expires a batch on
+  its next sender-loop pass, so equal deadlines can still fire on the app side
+  first. With the margin the app-level wait is a backstop against a stuck
+  producer thread and should never be the deadline that actually fires.
 * `delivery.timeout.ms < request.timeout.ms` is refused at startup with a
   message naming both variables, rather than degrading silently.
 * **To fail faster, lower `KAFKA_DELIVERY_TIMEOUT_MS`**, not
@@ -242,6 +256,15 @@ frame cap but still produce an over-large Kafka record do get a proper `AE`
 (`record_too_large`) — so keep the cap at or below `KAFKA_MAX_REQUEST_SIZE` if
 you want the largest possible share of size failures to be answered rather than
 dropped.
+
+**The operational consequence, and how to see it.** A sender holding a message
+that is over the cap will retry it forever and never get an explanatory `AE`, so
+the feed appears stalled. Every rejection therefore logs a `WARN` naming
+`MLLP_MAX_FRAME_BYTES` (alongside HAPI's own connection-teardown line, which
+carries the peer address) and increments
+`hl7_mllp_frames_rejected_total{reason="oversize"}`. A non-zero rate on that
+counter with no matching produce activity is a stuck oversized sender, not a
+network problem.
 
 Set `MLLP_MAX_FRAME_BYTES=0` to restore the previous, uncapped behaviour.
 

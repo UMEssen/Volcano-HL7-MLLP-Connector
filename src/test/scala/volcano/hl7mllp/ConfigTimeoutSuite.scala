@@ -18,22 +18,29 @@ class ConfigTimeoutSuite extends munit.FunSuite:
     hl7Encoding = "UTF-8", includeRaw = true, metricsEnabled = false, metricsPort = 9404
   )
 
-  test("the shipped defaults satisfy ack wait >= delivery >= request") {
+  test("the shipped defaults satisfy ack wait > delivery >= request") {
     val c = cfg(5000, Config.DefaultRequestTimeoutMs, Config.DefaultDeliveryTimeoutMs)
-    assert(c.kafkaAckWaitMs >= c.kafkaDeliveryTimeoutMs)
+    assert(c.kafkaAckWaitMs > c.kafkaDeliveryTimeoutMs, "the app wait must trail, not merely equal")
     assert(c.kafkaDeliveryTimeoutMs >= c.kafkaRequestTimeoutMs)
   }
 
-  test("an ack timeout below the delivery budget is raised to it") {
+  test("an ack timeout below the delivery budget is raised past it by the margin") {
     val c = cfg(5000, 5000, 10000)
-    assertEquals(c.kafkaAckWaitMs, 10000)
-    assert(c.ackWaitWasRaised)
+    assertEquals(c.kafkaAckWaitMs, 10000 + Config.AckWaitMarginMs)
   }
 
   test("an ack timeout above the delivery budget is left alone") {
     val c = cfg(30000, 5000, 10000)
     assertEquals(c.kafkaAckWaitMs, 30000)
-    assert(!c.ackWaitWasRaised)
+  }
+
+  test("the app wait always trails the delivery budget, whatever the ack timeout") {
+    for ack <- Seq(1, 500, 5000, 9999, 10000, 12000, 30000) do
+      val c = cfg(ack, 5000, 10000)
+      assert(
+        c.kafkaAckWaitMs > c.kafkaDeliveryTimeoutMs,
+        s"ack=$ack gave wait=${c.kafkaAckWaitMs} against delivery=${c.kafkaDeliveryTimeoutMs}"
+      )
   }
 
   test("a delivery budget shorter than one request round trip is rejected") {
