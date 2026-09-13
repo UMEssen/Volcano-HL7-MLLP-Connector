@@ -118,7 +118,14 @@ object HL7ToJsonConverter:
             out.add(extractSegment(name, seg, encodingChars))
           case nested: Group =>
             appendGroup(nested, encodingChars, out)
-          case _ => // A Structure is only ever a Segment or a Group.
+          // `Structure` has exactly two sub-interfaces in hapi-base 2.6.0,
+          // `Segment` and `Group`, and everything else in the hierarchy sits
+          // under one of them — `SuperStructure` (the 2.6+ choice-element
+          // shape) extends `Group`, so it is descended into by the arm above.
+          // This arm is therefore unreachable; it is not made to throw because
+          // an exception here would turn a message the connector can otherwise
+          // deliver into an AE.
+          case _ => ()
         }
       }
     }

@@ -66,12 +66,41 @@ class SegmentWalkSuite extends munit.FunSuite:
       "OBR|1|PLACER001|FILLER001|PANEL^Panel name^L\r" +
       "ZZZ|1|local\r"
 
+  // Two ORDER_OBSERVATION repetitions, each with its own OBSERVATION/OBX. The
+  // repetition index restarts inside every group instance, so both results are
+  // named "OBX" — the case the issue flags as the one `segment_name` alone
+  // cannot disambiguate.
+  private val OruTwoOrderGroups =
+    "MSH|^~\\&|APP_A|FAC_A|APP_B|FAC_B|20250101000000||ORU^R01^ORU_R01|MSGID0006|P|2.5\r" +
+      "PID|1||PATID001^^^AUTH||SAMPLE^TEST^A||19700101|F\r" +
+      "OBR|1||FILLER001|PANEL1^Panel one^L\r" +
+      "OBX|1|NM|CODE1^Analyte one^L||1.0|unit|||||F\r" +
+      "OBR|2||FILLER002|PANEL2^Panel two^L\r" +
+      "OBX|1|NM|CODE2^Analyte two^L||2.0|unit|||||F\r"
+
+  // An order with no results: OBX is required inside ORU_R01's OBSERVATION
+  // group and this message does not carry one, so the walk must not conjure an
+  // empty entry for the structure HAPI declares but the message omitted.
+  private val OruOrderWithoutResults =
+    "MSH|^~\\&|APP_A|FAC_A|APP_B|FAC_B|20250101000000||ORU^R01^ORU_R01|MSGID0007|P|2.5\r" +
+      "PID|1||PATID001^^^AUTH||SAMPLE^TEST^A||19700101|F\r" +
+      "OBR|1||FILLER001|PANEL^Panel name^L\r"
+
+  // ADT_A01 declares PV1 as required and this message omits it.
+  private val AdtWithoutRequiredPv1 =
+    "MSH|^~\\&|APP_A|FAC_A|APP_B|FAC_B|20250101000000||ADT^A01^ADT_A01|MSGID0008|P|2.5\r" +
+      "EVN|A01|20250101000000\r" +
+      "PID|1||PATID001^^^AUTH||SAMPLE^TEST^A||19700101|F\r"
+
   private val AllFixtures = Map(
     "ORU_R01 with OBR/OBX groups" -> OruWithGroups,
     "ORU_R01 with a non-contiguous OBX repeat" -> OruNonContiguousRepeat,
     "ADT_A01 with PROCEDURE and INSURANCE groups" -> AdtWithNestedGroups,
     "OML_O21 order group" -> OmlOrderGroup,
-    "OMG_O19 order group with a Z-segment" -> OmgOrderGroupWithZSegment
+    "OMG_O19 order group with a Z-segment" -> OmgOrderGroupWithZSegment,
+    "ORU_R01 with two ORDER_OBSERVATION groups" -> OruTwoOrderGroups,
+    "ORU_R01 order with no results" -> OruOrderWithoutResults,
+    "ADT_A01 without the required PV1" -> AdtWithoutRequiredPv1
   )
 
   // --- harness --------------------------------------------------------------
@@ -206,6 +235,39 @@ class SegmentWalkSuite extends munit.FunSuite:
       val expected = rawSegmentCount(er7)
       assertEquals(namesOf(envelope(structureParser, er7)).size, expected, s"$label (structure parse)")
       assertEquals(namesOf(envelope(genericParser, er7)).size, expected, s"$label (generic parse)")
+  }
+
+  test("a repeated group keeps each instance's segments in document order") {
+    val msg = structureParser.parse(OruTwoOrderGroups)
+    assertEquals(msg.getClass.getName, "ca.uhn.hl7v2.model.v25.message.ORU_R01")
+    // Both results really are in different instances of the same group, so the
+    // pair is exactly the case the issue calls out: same `segment_name`, same
+    // repetition index, different order.
+    assertEquals(groupPath(findSegment(msg, "OBX").get), Seq("PATIENT_RESULT", "ORDER_OBSERVATION", "OBSERVATION"))
+
+    val segments = segmentsOf(HL7ToJsonConverter.convert(msg, structureParser))
+    assertEquals(segments.map(_._1), Seq("MSH", "PID", "OBR", "OBX", "OBR", "OBX"))
+    // Position, not name, is what tells the two apart — each result follows the
+    // order it belongs to.
+    assertEquals(segments(2)._2.head, "1.0=1")
+    assertEquals(segments(3)._2(2), "3.0=CODE1^Analyte one^L")
+    assertEquals(segments(4)._2.head, "1.0=2")
+    assertEquals(segments(5)._2(2), "3.0=CODE2^Analyte two^L")
+  }
+
+  test("no phantom segment for a required structure the message omitted") {
+    // A group's children are not all optional: OBX is required inside
+    // ORU_R01's OBSERVATION group and PV1 is required in ADT_A01. HAPI does not
+    // materialise a repetition for a structure the message did not carry, so
+    // descending into the tree must not add a field-less entry for one.
+    for (label, er7) <- Seq(
+        "ORU order with no results" -> OruOrderWithoutResults,
+        "ADT without PV1" -> AdtWithoutRequiredPv1
+      )
+    do
+      val segments = segmentsOf(envelope(structureParser, er7))
+      assertEquals(segments.size, rawSegmentCount(er7), label)
+      assert(segments.forall(_._2.nonEmpty), s"$label: field-less segment in $segments")
   }
 
   test("no phantom segment for a group the message did not carry") {
