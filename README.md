@@ -73,6 +73,7 @@ Configure via environment variables:
 |----------|---------|-------------|
 | `MLLP_PORT` | `2575` | Port to listen on for MLLP connections |
 | `MLLP_TLS` | `false` | Enable TLS for MLLP (set to `true` for encrypted) |
+| `MLLP_MAX_FRAME_BYTES` | `KAFKA_MAX_REQUEST_SIZE` | Hard cap on one inbound MLLP frame, enforced at the wire before parsing. `0` disables it. |
 | `HL7_ENCODING` | `UTF-8` | Character encoding (UTF-8, ISO-8859-1, windows-1252, US-ASCII). MSH-18 is ignored. |
 | `HL7_INCLUDE_RAW` | `true` | Include the raw ER7 string in the JSON envelope |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker addresses |
@@ -83,7 +84,9 @@ Configure via environment variables:
 | `KAFKA_BUFFER_MEMORY` | `67108864` | Producer buffer (bytes) |
 | `KAFKA_COMPRESSION_TYPE` | `lz4` | Producer compression |
 | `KAFKA_CLIENT_ID` | `volcano-hl7-mllp` | Kafka client identifier |
-| `KAFKA_ACK_TIMEOUT_MS` | `5000` | Kafka acknowledgment timeout (also bounds `max.block.ms`) |
+| `KAFKA_ACK_TIMEOUT_MS` | `5000` | How long a Kafka outage may block `send()` itself; sets `max.block.ms`. Raised to `KAFKA_DELIVERY_TIMEOUT_MS` for the ACK wait — see [Delivery semantics](#delivery-semantics). |
+| `KAFKA_REQUEST_TIMEOUT_MS` | `5000` | `request.timeout.ms` — one broker round trip |
+| `KAFKA_DELIVERY_TIMEOUT_MS` | `10000` | `delivery.timeout.ms` — the producer's total retry budget per record. The ACK wait is derived as this plus a 2s margin. **Lower this to make the connector NAK faster.** |
 | `METRICS_ENABLED` | `true` | Expose Prometheus `/metrics` + `/healthz` |
 | `METRICS_PORT` | `9404` | Metrics/health HTTP port |
 | `JAVA_OPTS` | `-Xmx512m -Xms256m` | JVM options |
@@ -110,12 +113,21 @@ Prometheus metrics + health are served on `METRICS_PORT` (default `9404`):
 - `GET /metrics` — Prometheus text exposition
 - `GET /healthz` — liveness (process up)
 
-Key metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processed_total{result}`, `hl7_kafka_produced_total{topic}`, `hl7_kafka_produce_failures_total{reason}`, `hl7_kafka_produce_duration_seconds`, `hl7_messages_in_flight`, plus JVM/process metrics. The MLLP TCP probe stays healthy during a Kafka outage by design (so the sender buffers), so **alert on `hl7_kafka_produce_failures_total`** rather than on pod health.
+Key metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processed_total{result}`, `hl7_kafka_produced_total{topic}`, `hl7_kafka_produce_failures_total{reason}`, `hl7_kafka_produce_duration_seconds`, `hl7_messages_in_flight`, `hl7_mllp_frames_rejected_total{reason}`, plus JVM/process metrics. The MLLP TCP probe stays healthy during a Kafka outage by design (so the sender buffers), so **alert on `hl7_kafka_produce_failures_total`** rather than on pod health.
 
 ## JSON Output Format
 
+Field values in `segments[].fields[].value` are the field's **ER7 encoding** —
+exactly the substring the field occupies in `hl7_raw`. Components are joined
+with `^`, subcomponents with `&`, repetitions are already split into separate
+entries, and delimiter characters occurring inside data stay escaped (`\F\`,
+`\S\`, …). The two delimiter-defining fields, `MSH-1` and `MSH-2` (and their
+`FHS`/`BHS` equivalents), are emitted verbatim, since escaping the characters
+they declare would be circular.
+
 ```json
 {
+  "schema_version": "1.1",
   "hl7_raw": "MSH|^~\\&|SENDING_APP|...",
   "metadata": {
     "message_type": "ADT",
@@ -134,12 +146,133 @@ Key metrics: `hl7_messages_received_total{message_type}`, `hl7_messages_processe
       "segment_name": "MSH",
       "fields": [
         {"field": 1, "repetition": 0, "value": "|"},
-        {"field": 3, "repetition": 0, "value": "HD[SENDING_APP]"}
+        {"field": 2, "repetition": 0, "value": "^~\\&"},
+        {"field": 3, "repetition": 0, "value": "SENDING_APP"},
+        {"field": 9, "repetition": 0, "value": "ADT^A01^ADT_A01"}
       ]
     }
   ]
 }
 ```
+
+### Envelope versions
+
+`schema_version` is emitted both in the body and as a Kafka header, so a
+consumer can branch without guessing.
+
+| Version | Change |
+|---------|--------|
+| `1.0` | Initial shape. `segments[].fields[].value` was HAPI's `Type.toString()`, which is a *debug* rendering: every non-primitive field arrived wrapped in its datatype class name — `HD[SENDING_APP]`, `MSG[ADT^A01^ADT_A01]`, `Varies[...]`. |
+| `1.1` | `segments[].fields[].value` is the field's ER7 encoding (above). No shape change; the wrappers are gone, and a primitive containing an escaped delimiter now keeps the escape rather than the decoded character. |
+
+The primitive case is the one delta that is not just wrapper removal, and it is
+worth being precise about: `AbstractPrimitive.toString()` returns `getValue()`,
+the *decoded* value, so a primitive whose wire form was `re\F\f` used to appear
+as `re|f` — a bare field separator inside a single-component value, and `a\S\b`
+used to appear as `a^b`, which any consumer splitting on `^` reads as two
+components. Only primitives behaved that way; `AbstractType.toString()` wraps
+everything else and preserves the escapes inside the wrapper, so composites see
+wrapper removal and nothing more.
+
+Consumers that strip the `1.0` wrappers must keep doing so for as long as they
+may replay archived `1.0` records.
+
+## Delivery semantics
+
+### ACK ordering
+
+The handler is fully synchronous: parse → build envelope → `producer.send(...)`
+→ **block until the broker acknowledges** → only then generate the `AA`. Any
+failure on that path returns an `AE` instead. A message is therefore never
+acknowledged to the sender before it is durably in Kafka (`acks=all`,
+`enable.idempotence=true`), and the connector keeps no local buffer — durability
+of the retry is deliberately pushed back to the sender, which holds the message
+and resends on anything that is not an `AA`.
+
+### The timeout chain
+
+Four values have to nest, and the connector enforces that rather than leaving it
+to whoever edits the environment:
+
+```
+app ACK wait  >   delivery.timeout.ms  >=  request.timeout.ms  (+ linger.ms, 0 here)
+(derived)         KAFKA_DELIVERY_TIMEOUT_MS   KAFKA_REQUEST_TIMEOUT_MS
+
+max.block.ms  =   KAFKA_ACK_TIMEOUT_MS        (how long an outage may block send() itself)
+```
+
+* The wait on the send future is **derived**: `max(KAFKA_ACK_TIMEOUT_MS,
+  KAFKA_DELIVERY_TIMEOUT_MS + 2000)`. `Future.get(timeout, unit)` does **not**
+  cancel the underlying send — the producer keeps retrying for its full delivery
+  budget — so an app-level wait shorter than `delivery.timeout.ms` returns an
+  `AE` for a record that is still in flight and can still be accepted. The
+  sender then resends, and the pipeline gets two copies of a message it was told
+  had failed. Deriving the wait removes that window by construction.
+* The wait **trails** the delivery budget rather than equalling it. Both clocks
+  start almost together (the delivery budget when `send()` appends the record,
+  the app wait when `send()` returns), but the producer only expires a batch on
+  its next sender-loop pass, so equal deadlines can still fire on the app side
+  first. With the margin the app-level wait is a backstop against a stuck
+  producer thread and should never be the deadline that actually fires.
+* `delivery.timeout.ms < request.timeout.ms` is refused at startup with a
+  message naming both variables, rather than degrading silently.
+* **To fail faster, lower `KAFKA_DELIVERY_TIMEOUT_MS`**, not
+  `KAFKA_ACK_TIMEOUT_MS` — the latter only shrinks the half of the budget the
+  sender cannot see.
+
+### The duplicate window that remains
+
+Closing the timeout race does not make delivery exactly-once, and nothing here
+can. One window is inherent to acknowledging over a network:
+
+> The broker persists the record and acknowledges it; the `AA` is then lost on
+> the way back to the sender — a socket reset, or the connector dying between
+> the broker ack and the MLLP layer flushing the acknowledgment. The sender
+> never sees an `AA`, holds the message, and resends it.
+
+The resend carries the same MSH-10, so it produces the same Kafka key and lands
+on the same partition — but the topics are not compacted, so **nothing at the
+Kafka layer removes the duplicate**. Consumers must be idempotent; MSH-10 is the
+intended dedup handle (see
+[ADR 0001](docs/decisions/0001-kafka-key-msh10.md)).
+
+The practical consequence when debugging a duplicate-count anomaly: an `AE`
+proves the connector could not confirm the write, **not** that nothing reached
+Kafka.
+
+### Inbound frame-size cap
+
+`MLLP_MAX_FRAME_BYTES` (default: `KAFKA_MAX_REQUEST_SIZE`) caps a single inbound
+MLLP frame as it is read off the socket, so an oversized frame costs a bounded
+amount of memory and parse time instead of one proportional to whatever the
+sender chose to send. Rejections are counted by
+`hl7_mllp_frames_rejected_total{reason="oversize"}`.
+
+An oversized frame gets **no `AE`**: HAPI routes a reader failure to connection
+teardown without reaching the responder, and there is no parsed message to build
+an acknowledgment from anyway. The sender sees the connection drop, which under
+its hold-and-retry contract is the same signal as a NAK. Messages that fit the
+frame cap but still produce an over-large Kafka record do get a proper `AE`
+(`record_too_large`) — so keep the cap at or below `KAFKA_MAX_REQUEST_SIZE` if
+you want the largest possible share of size failures to be answered rather than
+dropped.
+
+**The operational consequence, and how to see it.** A sender holding a message
+that is over the cap will retry it forever and never get an explanatory `AE`, so
+the feed appears stalled. Every rejection therefore logs a `WARN` naming
+`MLLP_MAX_FRAME_BYTES` (alongside HAPI's own connection-teardown line, which
+carries the peer address) and increments
+`hl7_mllp_frames_rejected_total{reason="oversize"}`. A non-zero rate on that
+counter with no matching produce activity is a stuck oversized sender, not a
+network problem.
+
+Set `MLLP_MAX_FRAME_BYTES=0` to restore the previous, uncapped behaviour.
+
+## Design decisions
+
+Architecture decision records live in [`docs/decisions/`](docs/decisions/):
+
+* [0001 — Kafka record key is MSH-10, not a patient identifier](docs/decisions/0001-kafka-key-msh10.md)
 
 ## Testing with Sample HL7 Message
 

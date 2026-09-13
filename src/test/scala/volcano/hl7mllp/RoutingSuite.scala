@@ -68,7 +68,7 @@ class RoutingSuite extends munit.FunSuite:
 
   test("envelope is compact and versioned") {
     val json = HL7ToJsonConverter.convert(parser.parse(sample), parser)
-    assert(json.contains("\"schema_version\":\"1.0\""))
+    assert(json.contains(s"\"schema_version\":\"${HL7ToJsonConverter.SchemaVersion}\""))
     assert(json.contains("\"hl7_raw\""))
     assert(!json.contains("\n  "), "envelope must be compact (no pretty-printing)")
   }

@@ -47,6 +47,12 @@ object Metrics:
     .labelNames("reason")
     .register()
 
+  val framesRejected: Counter = Counter.build()
+    .name("hl7_mllp_frames_rejected_total")
+    .help("Inbound MLLP frames refused at the wire before parsing, by reason (oversize).")
+    .labelNames("reason")
+    .register()
+
   val produceDuration: Histogram = Histogram.build()
     .name("hl7_kafka_produce_duration_seconds")
     .help("Time from send() to broker ack for successful produces.")
@@ -67,6 +73,7 @@ object Metrics:
     produceFailures.labels("record_too_large")
     produceFailures.labels("hl7_parse")
     produceFailures.labels("other")
+    framesRejected.labels("oversize")
 
   // isLive should report true only while the MLLP listener is actually
   // running — so /healthz is true MLLP liveness, not just "the process is up".

@@ -22,8 +22,15 @@ object KafkaProducerFactory:
     props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
     props.put(ProducerConfig.RETRIES_CONFIG, Integer.valueOf(Integer.MAX_VALUE))
     props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, "5")
-    props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, Integer.valueOf(5000))
-    props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.valueOf(Math.max(cfg.kafkaAcksTimeoutMs, 10000)))
+    // Timeout chain: request.timeout.ms bounds one broker round trip,
+    // delivery.timeout.ms is the producer's total retry budget for a record,
+    // and the handler's own wait on the send future (Config.kafkaAckWaitMs) is
+    // derived to be >= delivery.timeout.ms. Without that last relationship the
+    // handler can NAK at its own deadline while the producer is still retrying
+    // underneath, so the record lands anyway and the sender resends it.
+    // Config.validateTimeouts enforces delivery >= request at startup.
+    props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, Integer.valueOf(cfg.kafkaRequestTimeoutMs))
+    props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.valueOf(cfg.kafkaDeliveryTimeoutMs))
 
     // Message sizing: the Kafka client default max.request.size is 1 MiB and
     // is checked client-side before the record ever reaches the broker. HL7
