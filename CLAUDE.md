@@ -81,7 +81,7 @@ The connector is split into focused single-responsibility files under `src/main/
 - `Config.scala` — environment-variable configuration (`Config.load()`).
 - `KafkaProducerFactory.scala` — builds the producer (reliability, sizing, SASL/SSL).
 - `HL7MessageProcessor.scala` — topic resolution (static vs derived), partition key, Kafka headers.
-- `HL7ToJsonConverter.scala` — HAPI message → JSON envelope (compact, `schema_version`). Field values are the field's **ER7 encoding** (`PipeParser.encode`), never `Type.toString()` — that is HAPI's debug rendering and wraps non-primitives in their datatype class name (`HD[...]`, `MSG[...]`, `Varies[...]`). `MSH-1`/`MSH-2` are emitted verbatim; escaping the delimiters they declare would be circular.
+- `HL7ToJsonConverter.scala` — HAPI message → JSON envelope (compact, `schema_version`). `segments[]` is a flat array in document order: HAPI returns a *tree* (`Message` is a `Group`, whose children are segments or nested groups), so `extractSegments` walks it recursively — a structure-parsed `ORU_R01` nests `PV1` three groups deep and a one-level loop dropped every grouped segment. Field values are the field's **ER7 encoding** (`PipeParser.encode`), never `Type.toString()` — that is HAPI's debug rendering and wraps non-primitives in their datatype class name (`HD[...]`, `MSG[...]`, `Varies[...]`). `MSH-1`/`MSH-2` are emitted verbatim; escaping the delimiters they declare would be circular.
 - `MllpFrameLimit.scala` — inbound MLLP frame-size cap (`FrameLimitingInputStream`, `BoundedMinLowerLayerProtocol`).
 - `HL7AckGenerator.scala` — AA/AE acknowledgments.
 - `Metrics.scala` — Prometheus registry + embedded `/metrics` and `/healthz` HTTP server.
@@ -256,6 +256,7 @@ This strategy ensures SLF4J 2.x can discover the Logback implementation via Serv
 
 - **`RoutingSuite.scala`** — MUnit unit tests for topic resolution (static/derived), partition key + fallback, Kafka headers, and the JSON envelope. Run with `sbt test`.
 - **`EnvelopeEncodingSuite.scala`** — pins the envelope's field-value contract: ER7 encoding, no datatype-class wrappers, delimiter fields verbatim, values match `hl7_raw`.
+- **`SegmentWalkSuite.scala`** — pins that `segments[]` is flat and complete on both parse paths: the structure parse (generated `v25.*` classes) and the generic parse (`GenericMessage`, forced with `GenericModelClassFactory`) yield the same segments in the same order, the envelope's segment count equals `hl7_raw`'s, and the two known path differences (a suffixed non-contiguous repeat, and `MSH-1`/`MSH-2`) are pinned rather than left to drift.
 - **`ConfigTimeoutSuite.scala`** — the producer timeout chain (ack wait >= delivery >= request) and its startup validation.
 - **`MllpFrameLimitSuite.scala`** — the inbound frame cap: per-frame budget, bounded buffering, synthetic oversized frame.
 - **`JsonConversionTest.scala`** — a `runMain` smoke test that parses a sample message and prints/asserts the JSON envelope. Run with `sbt "Test/runMain volcano.hl7mllp.JsonConversionTest"`.

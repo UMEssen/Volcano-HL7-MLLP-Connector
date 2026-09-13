@@ -1,6 +1,6 @@
 package volcano.hl7mllp
 
-import ca.uhn.hl7v2.model.{Message, Primitive, Segment, Type, Varies}
+import ca.uhn.hl7v2.model.{Group, Message, Primitive, Segment, Type, Varies}
 import ca.uhn.hl7v2.parser.{EncodingCharacters, PipeParser}
 import ca.uhn.hl7v2.util.Terser
 import com.google.gson.{Gson, JsonObject, JsonArray}
@@ -71,22 +71,64 @@ object HL7ToJsonConverter:
     metadata.addProperty("version", Option(terser.get("/MSH-12")).getOrElse(""))
     metadata
 
+  // `segments[]` is a FLAT list in document order, whatever shape HAPI gave the
+  // message. That needs a recursive walk, because HAPI hands back a tree:
+  // `Message` is itself a `Group`, `Group.getNames` names only the *immediate*
+  // children, and each child is either a `Segment` or a nested `Group`
+  // (`Group.isGroup`). Which shape a message has is decided by the parse path
+  // and not by the message:
+  //
+  //   - A generated structure class (`v25.message.ORU_R01` and friends, from
+  //     hapi-structures-v25) nests segments inside the groups the standard
+  //     defines. `PV1` in an `ORU_R01` sits three groups deep, under
+  //     PATIENT_RESULT / PATIENT / VISIT.
+  //   - `GenericMessage` — any version with no structures library on the
+  //     classpath, or a structure that does not resolve — is flat: every
+  //     segment is an immediate child of the message.
+  //
+  // Walking one level and discarding the groups therefore dropped every
+  // grouped segment *and its whole subtree*: a structure-parsed ORU_R01
+  // produced an `MSH`-only `segments[]` with no exception and no log line,
+  // while `hl7_raw` still carried everything. Descending makes both parse
+  // paths emit the same segments in the same order. For a flat message the
+  // walk degenerates to the previous single loop, so nothing changes there.
   private def extractSegments(msg: Message, encodingChars: EncodingCharacters): JsonArray =
     val segments = new JsonArray()
-    val names = msg.getNames()
+    appendGroup(msg, encodingChars, segments)
+    segments
+
+  // `name` is the child's key *within its own group*, which is what
+  // `segment_name` has always carried and what consumers normalise today:
+  // HAPI appends an index to a repeat that is not contiguous with its first
+  // occurrence ("OBX", "NTE", "OBX2"). Inside a structure class the index
+  // restarts per parent, so the key is not globally unique — position in this
+  // array is the ordering handle, as it already was for a flat message.
+  private def appendGroup(group: Group, encodingChars: EncodingCharacters, out: JsonArray): Unit =
+    val names = group.getNames()
 
     for (i <- 0 until names.length) {
       val name = names(i)
-      val structures = msg.getAll(name)
+      // Only populated repetitions come back: HAPI returns an empty array for a
+      // child the message did not carry, so an optional group contributes
+      // nothing rather than a phantom empty segment.
+      val structures = group.getAll(name)
       for (structure <- structures) {
         structure match {
           case seg: Segment =>
-            segments.add(extractSegment(name, seg, encodingChars))
-          case _ => // Skip non-segment structures
+            out.add(extractSegment(name, seg, encodingChars))
+          case nested: Group =>
+            appendGroup(nested, encodingChars, out)
+          // `Structure` has exactly two sub-interfaces in hapi-base 2.6.0,
+          // `Segment` and `Group`, and everything else in the hierarchy sits
+          // under one of them — `SuperStructure` (the 2.6+ choice-element
+          // shape) extends `Group`, so it is descended into by the arm above.
+          // This arm is therefore unreachable; it is not made to throw because
+          // an exception here would turn a message the connector can otherwise
+          // deliver into an AE.
+          case _ => ()
         }
       }
     }
-    segments
 
   private def extractSegment(name: String, seg: Segment, encodingChars: EncodingCharacters): JsonObject =
     val segmentObj = new JsonObject()
