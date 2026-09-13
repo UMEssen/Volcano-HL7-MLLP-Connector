@@ -155,6 +155,34 @@ they declare would be circular.
 }
 ```
 
+### Segments and structure groups
+
+`segments[]` is a **flat array in document order**. HAPI does not hand the
+parser a flat message: depending on which parse path it takes, segments can sit
+several levels deep inside structure *groups*, and the converter walks that tree
+so the envelope looks the same either way.
+
+- **Structure parse.** When a structures library for the version in `MSH-12` is
+  on the classpath and the type/trigger resolves to a structure in it (this repo
+  ships `hapi-structures-v25`, so: `MSH-12` = `2.5` with a known type), HAPI
+  returns a generated class such as `v25.message.ORU_R01`, and segments are
+  nested in the groups the standard defines — `PV1` sits three groups deep,
+  under `PATIENT_RESULT` / `PATIENT` / `VISIT`.
+- **Generic parse.** Anything else returns a `GenericMessage`, which is flat:
+  every segment is an immediate child of the message.
+
+Both produce the same segments in the same order. A group never appears as an
+entry of its own, and a group the message did not carry contributes nothing.
+
+`segment_name` is the name HAPI gives the segment inside its own group,
+verbatim. On the flat path HAPI appends an index to a repeat that is **not
+contiguous** with its first occurrence — `OBX`, `NTE`, `OBX2` — while a
+contiguous repeat keeps the plain name for every occurrence. Inside a structure
+class each repeat is a fresh group instance, so the plain name is kept there
+too. The name is therefore not a unique handle in either shape: **position in
+`segments[]` is the ordering handle**, and a consumer that needs the segment
+type should strip a trailing index.
+
 ### Envelope versions
 
 `schema_version` is emitted both in the body and as a Kafka header, so a
