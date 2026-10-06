@@ -92,6 +92,28 @@ class SegmentWalkSuite extends munit.FunSuite:
       "EVN|A01|20250101000000\r" +
       "PID|1||PATID001^^^AUTH||SAMPLE^TEST^A||19700101|F\r"
 
+  // Imaging orders. OMI_O23 is the HL7 2.5 imaging order; its IPC segment
+  // (Imaging Procedure Control) carries the accession (IPC-1), the requested
+  // procedure ID (IPC-2) and the Study Instance UID (IPC-3), and sits inside
+  // the ORDER group, so it only reaches the envelope through the group walk.
+  private val OmiImagingOrderWithIpc =
+    "MSH|^~\\&|APP_A|FAC_A|APP_B|FAC_B|20250101000000||OMI^O23^OMI_O23|MSGID0009|P|2.5\r" +
+      "PID|1||PATID001^^^AUTH||SAMPLE^TEST^A||19700101|F\r" +
+      "ORC|NW|PLACER001|FILLER001\r" +
+      "OBR|1|PLACER001|FILLER001|PROC1^Procedure name^L\r" +
+      "IPC|ACC001|RP001|1.2.3.4.5.6789|SPS001|CT\r"
+
+  // The pre-2.5 counterpart: an ORM_O01 carrying the Study Instance UID in
+  // ZDS-1, a Z-segment defined by the IHE Radiology Technical Framework rather
+  // than by HL7, as uid^^application^DICOM.
+  private val OrmOrderWithZds =
+    "MSH|^~\\&|APP_A|FAC_A|APP_B|FAC_B|20250101000000||ORM^O01^ORM_O01|MSGID0010|P|2.5\r" +
+      "PID|1||PATID001^^^AUTH||SAMPLE^TEST^A||19700101|F\r" +
+      "ORC|NW|PLACER001|FILLER001\r" +
+      "OBR|1|PLACER001|FILLER001|PROC1^Procedure name^L\r" +
+      "ZDS|1.2.3.4.5.6789^^APP_A^DICOM\r"
+
+
   private val AllFixtures = Map(
     "ORU_R01 with OBR/OBX groups" -> OruWithGroups,
     "ORU_R01 with a non-contiguous OBX repeat" -> OruNonContiguousRepeat,
@@ -100,7 +122,9 @@ class SegmentWalkSuite extends munit.FunSuite:
     "OMG_O19 order group with a Z-segment" -> OmgOrderGroupWithZSegment,
     "ORU_R01 with two ORDER_OBSERVATION groups" -> OruTwoOrderGroups,
     "ORU_R01 order with no results" -> OruOrderWithoutResults,
-    "ADT_A01 without the required PV1" -> AdtWithoutRequiredPv1
+    "ADT_A01 without the required PV1" -> AdtWithoutRequiredPv1,
+    "OMI_O23 imaging order with IPC" -> OmiImagingOrderWithIpc,
+    "ORM_O01 imaging order with ZDS" -> OrmOrderWithZds
   )
 
   // --- harness --------------------------------------------------------------
@@ -214,6 +238,29 @@ class SegmentWalkSuite extends munit.FunSuite:
     val omg = structureParser.parse(OmgOrderGroupWithZSegment)
     assertEquals(omg.getClass.getName, "ca.uhn.hl7v2.model.v25.message.OMG_O19")
     assertEquals(namesOf(HL7ToJsonConverter.convert(omg, structureParser)), Seq("MSH", "PID", "ORC", "OBR", "ZZZ"))
+  }
+
+  test("an OMI_O23 imaging order keeps IPC, study UID included") {
+    val msg = structureParser.parse(OmiImagingOrderWithIpc)
+    assertEquals(msg.getClass.getName, "ca.uhn.hl7v2.model.v25.message.OMI_O23")
+    // Measured from the model: IPC is not a top-level child.
+    assert(groupPath(findSegment(msg, "IPC").getOrElse(fail("IPC missing from the parsed model"))).nonEmpty)
+
+    val segments = segmentsOf(HL7ToJsonConverter.convert(msg, structureParser))
+    assertEquals(segments.map(_._1), Seq("MSH", "PID", "ORC", "OBR", "IPC"))
+    assertEquals(
+      segments.toMap.get("IPC"),
+      Some(Seq("1.0=ACC001", "2.0=RP001", "3.0=1.2.3.4.5.6789", "4.0=SPS001", "5.0=CT"))
+    )
+  }
+
+  test("an ORM_O01 imaging order keeps the ZDS study UID with its components") {
+    val msg = structureParser.parse(OrmOrderWithZds)
+    assertEquals(msg.getClass.getName, "ca.uhn.hl7v2.model.v25.message.ORM_O01")
+
+    val segments = segmentsOf(HL7ToJsonConverter.convert(msg, structureParser))
+    assertEquals(segments.map(_._1), Seq("MSH", "PID", "ORC", "OBR", "ZDS"))
+    assertEquals(segments.toMap.get("ZDS"), Some(Seq("1.0=1.2.3.4.5.6789^^APP_A^DICOM")))
   }
 
   // --- the two paths agree ---------------------------------------------------
